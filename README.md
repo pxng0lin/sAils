@@ -1,5 +1,5 @@
 # 🧠 sAils AI Agent
-![sAils Logo](sAils.png)
+![sAils Logo](sAils_small.png)
 ## Overview
 `sAils` is a self-contained AI assistant for end-to-end smart contract and documentation analysis. It integrates two internal tools:
 
