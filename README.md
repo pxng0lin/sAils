@@ -150,4 +150,4 @@ sails --contracts ./contracts --vuln-scan
 ---
 
 ## 📜 License
-MIT License © 2025 # 🧠 sAils AI Agent
+MIT License © 2025 pxng0lin/ThΞ CxgΞ
