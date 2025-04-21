@@ -57,6 +57,10 @@ import tempfile
 import random, time
 import ollama  # Import the ollama-python client
 
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+VECTOR_DB_PATH = os.path.join(SCRIPT_DIR, "vectorisation.db")
+DEEP_DB_PATH = os.path.join(SCRIPT_DIR, "smart_contracts_analysis.db")
+
 # New imports for handling different document types
 import pdfplumber
 import markdown
@@ -118,7 +122,7 @@ async_session = None
 # -------------------------------
 # SQLite Database Setup
 # -------------------------------
-DB_NAME = "smart_contracts_analysis.db"
+DB_NAME = DEEP_DB_PATH
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -1717,7 +1721,7 @@ def gather_analysis_context(session_folder, contracts, documents):
 
 # -------------------------------
 # Vulnerability Detection Functions
-def import_vulnerability_reports(vectorisation_db_path="vectorisation.db"):
+def import_vulnerability_reports(vectorisation_db_path=VECTOR_DB_PATH):
     """Import vulnerability reports from the vectorisation database"""
     try:
         # Check if the vectorisation database exists
@@ -2051,9 +2055,9 @@ Provide ONLY the detection template with NO explanation or other text.
     template = call_llm(prompt, ANALYSIS_MODEL)
     return template
 
-def direct_copy_vulnerability_templates(source_db="vectorisation.db", target_db=DB_NAME):
+def direct_copy_vulnerability_templates(source_db=VECTOR_DB_PATH, target_db=DB_NAME):
     """
-    Directly copy vulnerability templates from SFA_VectorEyes.py's database to DeepCurrent_v3.1.py's database
+    Directly copy vulnerability templates from VectorEyes.py's database to DeepCurrent_v3.1.py's database
     without involving LLM enhancement.
     """
     console.print(f"[cyan]Starting direct template copy from {source_db} to {target_db}...[/cyan]")
