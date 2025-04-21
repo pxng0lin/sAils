@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# SFA_VectorEyes.py
+# VectorEyes.py
 # /// script
 # requires-python = ">=3.8"
 # dependencies = [
@@ -14,7 +14,7 @@
 # ///
 
 """
-SFA_VectorEyes - Vulnerability Report Vectorisation & Detection Library Builder
+VectorEyes - Vulnerability Report Vectorisation & Detection Library Builder
 
 Features:
 1. Accept a URL (Markdown file or GitHub repo) for a vulnerability report.
@@ -51,7 +51,12 @@ from rich.align import Align
 from rich.box import SIMPLE
 
 # ---------------------- Global & Console Setup ----------------------
-DB_PATH = "vectorisation.db"
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+VECTOR_DB_PATH = os.path.join(SCRIPT_DIR, "vectorisation.db")
+DEEP_DB_PATH = os.path.join(SCRIPT_DIR, "smart_contracts_analysis.db")
+
+
+DB_PATH = VECTOR_DB_PATH
 console = Console()
 task_status = {}    # For background task statuses
 task_lock = threading.Lock()
@@ -2050,7 +2055,7 @@ def display_detection_library(library):
 
 # ---------------------- UI Layout & Main Loop ----------------------
 def render_layout() -> Panel:
-    header = Panel("[bold magenta]SFA VectorEyes[/bold magenta]", padding=(1,2), style="on blue")
+    header = Panel("[bold magenta]VectorEyes[/bold magenta]", padding=(1,2), style="on blue")
     menu_table = Table.grid(padding=1)
     menu_table.add_column(justify="left")
     menu_table.add_row("[bold blue]1.[/bold blue] Vectorize Report")
@@ -2450,7 +2455,7 @@ def main():
             "You can use Ollama (local) or OpenRouter (cloud) for LLM services.\n"
             "OpenRouter provides access to more powerful models but requires an API key.\n"
             "[bold cyan]For security, your API key will only be stored in memory for this session.[/bold cyan]",
-            title="Welcome to SFA VectorEyes",
+            title="Welcome to  VectorEyes",
             border_style="blue"
         ))
         
