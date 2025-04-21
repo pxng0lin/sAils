@@ -1,5 +1,3 @@
-# sAils.py - enhanced to auto-trigger on new directory creation and recursively find contracts
-
 #!/usr/bin/env python
 # /// script
 # requires-python = ">=3.8"
@@ -28,20 +26,32 @@ import asyncio
 import time
 import hashlib
 import sqlite3
+import concurrent.futures
 from datetime import datetime
 from typing import Optional, List
 
+
+
+# Ensure DB paths are resolved relative to where the script file lives (not where it's run from)
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+VECTOR_DB_PATH = os.path.join(SCRIPT_DIR, "vectorisation.db")
+DEEP_DB_PATH = os.path.join(SCRIPT_DIR, "smart_contracts_analysis.db")
+
+
+from rich.prompt import Prompt
 from prefect import task, flow
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from VectorEyes import process_markdown_file, init_db as init_vector_db, build_detection_library
-import DeepCurrent
 from DeepCurrent import (
     init_db as init_deep_db,
     process_contracts_parallel,
     process_document,
-    scan_contracts_for_vulnerabilities
+    scan_contracts_for_vulnerabilities,
+    ask_questions_about_analysis,
+    call_llm,
+    gather_analysis_context
 )
 
 DEFAULT_LLM_PROVIDER = "ollama"
@@ -65,9 +75,23 @@ def ingest_reports(report_urls: List[str]):
 
 @task
 def build_vuln_library(report_count: int):
-    if report_count <= 0:
-        print("No reports ingested, skipping library build.")
+    try:
+        conn = sqlite3.connect(VECTOR_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM detection_library")
+        detection_count = cur.fetchone()[0]
+        conn.close()
+        if detection_count > 0:
+            print(f"[INFO] Detection library already populated with {detection_count} templates. Skipping rebuild.")
+            return True
+    except Exception as e:
+        print(f"[ERROR] Could not check detection_library table: {e}")
         return False
+
+    if report_count <= 0:
+        print("[WARN] No new reports ingested this session and detection library is empty.")
+        return False
+
     return build_detection_library()
 
 def is_contract_already_analyzed(file_path):
@@ -75,7 +99,7 @@ def is_contract_already_analyzed(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect("smart_contracts_analysis.db")
+        conn = sqlite3.connect(DEEP_DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT id FROM contracts WHERE id = ?", (file_hash,))
         exists = cur.fetchone() is not None
@@ -143,30 +167,59 @@ def vuln_pipeline(
     run_vuln_scan: bool = False
 ):
     provider = llm_provider or DEFAULT_LLM_PROVIDER
-    DeepCurrent.LLM_PROVIDER = provider
     print(f"Using LLM provider: {provider}")
 
     if provider == "openrouter":
         model = openrouter_model or DEFAULT_OPENROUTER_MODEL
-        DeepCurrent.OPENROUTER_API_KEY = openrouter_key or DeepCurrent.OPENROUTER_API_KEY
-        DeepCurrent.ANALYSIS_MODEL = model
-        DeepCurrent.QUERY_MODEL = model
-        print(f"Using OpenRouter model: {model}")
     else:
         model = ollama_model or DEFAULT_OLLAMA_MODEL
-        DeepCurrent.MODEL_NAME = model
-        DeepCurrent.ANALYSIS_MODEL = model
-        DeepCurrent.QUERY_MODEL = model
-        print(f"Using Ollama model: {model}")
 
     initialize_databases()
     ingested = ingest_reports(report_urls)
     built = build_vuln_library(ingested)
     analyzed = scan_contracts(contract_dir, session_folder)
     docs = analyze_docs(doc_paths, session_folder)
-    vuln_results = False
-    if run_vuln_scan:
-        vuln_results = vuln_scan(session_folder)
+    vuln_results = vuln_scan(session_folder) if run_vuln_scan else False
+
+    ask_questions_about_analysis(session_folder)
+
+    context = gather_analysis_context(session_folder, [], [])
+    auto_questions = [
+        "What are the most questionable assumptions in this contract?",
+        "How would this code behave if an attacker calls this function repeatedly?",
+        "Does the design violate any known smart contract principles?",
+        "What could break if the protocol scales rapidly?",
+        "How resilient is this to changes in gas prices or chain conditions?",
+        "What does this contract depend on that it doesn't control?",
+        "Are there any implicit trust assumptions that could be dangerous?"
+    ]
+
+    qna_log = os.path.join(session_folder, "automated_insights.md")
+
+    def generate_answer(q):
+        prompt = f"""
+# Invasive Smart Contract Analysis
+
+## Context:
+{context[:48000]}
+
+## Question:
+{q}
+
+## Instructions:
+- Use ONLY the context above to answer.
+- Be critical, in-depth, and honest.
+- Suggest deeper tests, adversarial situations, or design clarifications.
+- Keep answers tightly focused, clear, and useful for auditors.
+"""
+        return q, call_llm(prompt)
+
+    with open(qna_log, "w", encoding="utf-8") as f:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = executor.map(generate_answer, auto_questions)
+            for question, answer in futures:
+                f.write(f"### Q: {question}\n\n{answer}\n\n---\n")
+
     notify({
         "reports_ingested": ingested,
         "library_built": built,
@@ -175,8 +228,6 @@ def vuln_pipeline(
         "vulnerabilities_scanned": vuln_results,
         "session_folder": session_folder
     })
-
-from rich.prompt import Prompt
 
 WATCHED_DIR = None
 
@@ -194,20 +245,20 @@ class NewDirectoryHandler(FileSystemEventHandler):
             return
 
         session_name = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        print(f"📁 Directory {trigger}: {path}")
+        print(f"\n📁 Directory {trigger}: {path}")
         print(f"🚀 Triggering analysis in session: {session_name}")
 
         vuln_pipeline(
             report_urls=[],
             contract_dir=path,
-                doc_paths=[],
-                session_folder=session_name,
-                run_vuln_scan=True
-            )
+            doc_paths=[],
+            session_folder=session_name,
+            run_vuln_scan=True
+        )
 
 def watch_for_new_dirs():
     global WATCHED_DIR
-    WATCHED_DIR = Prompt.ask("📂 Enter a glob pattern for folders to watch (e.g. '~/dev/*/web3')", default="~/Documents/web3/*")
+    WATCHED_DIR = Prompt.ask("📂 Enter a glob pattern for folders to watch (e.g. '~/Documents/web3/*')", default=" ~/Documents/web3/*")
     WATCHED_DIR = os.path.expanduser(WATCHED_DIR)
     print(f"📡 Resolving glob: {WATCHED_DIR}")
 
@@ -247,7 +298,33 @@ def main():
     parser.add_argument("--ollama-model", help="Local Ollama model name (default %s)." % DEFAULT_OLLAMA_MODEL)
     parser.add_argument("--vuln-scan", action="store_true", help="Run vulnerability scanning on the analyzed contracts.")
     parser.add_argument("--watch", action="store_true", help="Watch a folder for new contract directories.")
+    parser.add_argument("--vuln-scan-only", action="store_true", help="Only run vulnerability scan on given session or contracts.")
     args = parser.parse_args()
+
+    
+    
+    if args.vuln_scan_only:
+        initialize_databases()
+        # Check if detection_library already exists and is populated
+        try:
+            conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), VECTOR_DB_PATH))
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM detection_library")
+            count = cur.fetchone()[0]
+            conn.close()
+            if count == 0:
+                print("[ERROR] Detection library is empty. Please run with --reports to build it.")
+                return
+            else:
+                print(f"[INFO] Detection library ready with {count} templates.")
+        except Exception as e:
+            print(f"[ERROR] Failed to access detection library: {e}")
+            return
+
+        session = args.session or f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(session, exist_ok=True)
+        vuln_scan(session)
+        return
 
     if args.watch:
         watch_for_new_dirs()
@@ -269,7 +346,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-# ~/Documents/web3/*
