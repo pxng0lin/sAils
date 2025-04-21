@@ -28,6 +28,7 @@ import hashlib
 import sqlite3
 import concurrent.futures
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, List
 
 
@@ -299,6 +300,7 @@ def main():
     parser.add_argument("--vuln-scan", action="store_true", help="Run vulnerability scanning on the analyzed contracts.")
     parser.add_argument("--watch", action="store_true", help="Watch a folder for new contract directories.")
     parser.add_argument("--vuln-scan-only", action="store_true", help="Only run vulnerability scan on given session or contracts.")
+    
     args = parser.parse_args()
 
     
@@ -322,7 +324,29 @@ def main():
             return
 
         session = args.session or f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        session = args.session or f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        session_path = Path(session)
+        if session_path.exists() and session_path.is_file():
+            print(f"[WARN] Session name '{session}' is a file. Using fallback folder instead.")
+            session = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(session, exist_ok=True)
+        
+    if args.llm_provider:
+        import DeepCurrent
+        DeepCurrent.LLM_PROVIDER = args.llm_provider
+
+        if args.llm_provider == "openrouter":
+            if args.openrouter_key:
+                DeepCurrent.OPENROUTER_API_KEY = args.openrouter_key
+            DeepCurrent.ANALYSIS_MODEL = args.openrouter_model or "google/gemini-2.5-pro-exp-03-25:free"
+            DeepCurrent.QUERY_MODEL = DeepCurrent.ANALYSIS_MODEL
+
+        elif args.llm_provider == "ollama":
+            # You can optionally set a model here too for consistency
+            DeepCurrent.ANALYSIS_MODEL = "deepseek-r1:32b"
+            DeepCurrent.QUERY_MODEL = "deepseek-r1:32b"
+
         vuln_scan(session)
         return
 
