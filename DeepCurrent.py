@@ -91,7 +91,7 @@ OPENROUTER_DATA_USAGE = "null"  # Set to 'null' to use models without sharing da
 OPENROUTER_API_KEY = ""  # Will be prompted for this
 
 # General LLM settings
-MAX_TOKENS = 50000
+MAX_TOKENS = 40000
 MODEL_NAME = "deepseek-r1:32b"  # Default for Ollama
 ANALYSIS_MODEL = MODEL_NAME
 QUERY_MODEL    = MODEL_NAME
