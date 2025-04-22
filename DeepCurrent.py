@@ -474,7 +474,7 @@ def call_llm(prompt, model=None, max_retries=3, backoff_factor=2):
                         {"role": "system", "content": "You are a smart contract and protocol documentation analyzer."},
                         {"role": "user", "content": prompt}
                     ],
-                    "max_tokens": 40000,
+                    "max_tokens": 28000,
                     "temperature": 0.1,
                 }
                 
