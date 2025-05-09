@@ -1,5 +1,9 @@
 # 📄 README.md — Updated with LLM-Enhanced Vulnerability Detection
 
+<p align="center">
+  <img src="sAils_logo_small.png" alt="sAils Logo" width="200"/>
+</p>
+
 # 🧠 sAils AI Agent
 
 ## Overview
