@@ -1268,7 +1268,7 @@ def query_report(report_content, base_name, output_dir):
 # Question Answering Task
 
 ## Context Information:
-{report_content[:50000]}  # Limiting to first 50k chars if very large
+{report_content[:80000]}  # Limiting to first 50k chars if very large
 
 ## Question:
 {question}
@@ -1712,7 +1712,7 @@ def gather_analysis_context(session_folder, contracts, documents):
     combined_context = "\n".join(context_data)
     
     # Limit context size to avoid token limits
-    max_context_size = 50000  # Adjust based on model's limitations
+    max_context_size = 80000  # Adjust based on model's limitations
     if len(combined_context) > max_context_size:
         console.print(f"[yellow]Warning: Analysis context is very large. Truncating to {max_context_size} characters.[/yellow]")
         combined_context = combined_context[:max_context_size] + "\n...(content truncated due to size)..."

@@ -1,0 +1,58 @@
+# Python bytecode files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Large data files
+reports.json
+
+# Session and data directories
+sessions/
+merge_source/
+.cache/
+cache/
+response_cache/
+
+# Backup files
+*_backup_*
+*.bak
+*.swp
+*.tmp
+
+# Environment and secrets
+.env
+.venv
+env/
+venv/
+ENV/
+.env.local
+.api_keys
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+logs/
+*.log

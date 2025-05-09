@@ -63,10 +63,12 @@ task_lock = threading.Lock()
 
 # ---------------------- Database Functions ----------------------
 def init_db():
-    """Initialize the main reports and patterns tables."""
+    """Initialize database tables for vectorized report storage and detection library."""
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
+    cursor = conn.cursor()
+    
+    # Create or update the main reports table
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS reports (
             id TEXT PRIMARY KEY,
             source TEXT,
@@ -77,24 +79,29 @@ def init_db():
             metadata TEXT
         )
     ''')
-    c.execute('''
+    
+    # Create or update patterns table
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS patterns (
             report_id TEXT PRIMARY KEY,
             pattern TEXT
         )
     ''')
-    # Detection library table for aggregated robust templates
-    c.execute('''
+    
+    # Create or update detection library table
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS detection_library (
             vuln_type TEXT PRIMARY KEY,
             details TEXT,
             template TEXT
         )
     ''')
+    
     conn.commit()
     conn.close()
     
     # Create cache directory for API responses
+    CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
     if not os.path.exists(CACHE_DIR):
         os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -926,6 +933,10 @@ def init_detection_library_table():
       - vuln_type (TEXT PRIMARY KEY)
       - details (JSON string with aggregated questions, examples, insights)
       - template (Robust detection template as TEXT)
+      - vector_embedding (BLOB for vectorized embeddings)
+      - llm_template (TEXT for LLM-friendly template)
+      - schema_version (INTEGER for tracking schema changes)
+      - last_updated (TEXT for tracking last update timestamp)
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -933,7 +944,11 @@ def init_detection_library_table():
         CREATE TABLE IF NOT EXISTS detection_library (
             vuln_type TEXT PRIMARY KEY,
             details TEXT,
-            template TEXT
+            template TEXT,
+            vector_embedding BLOB,
+            llm_template TEXT,
+            schema_version INTEGER DEFAULT 1,
+            last_updated TEXT
         )
     ''')
     conn.commit()
@@ -1018,6 +1033,12 @@ def cluster_vulnerabilities(vuln_details_list, model=DEFAULT_OLLAMA_MODEL):
     
     console.print("[bold cyan]🔍 Starting enhanced vulnerability clustering...[/bold cyan]")
     console.print(f"[bold blue]Found {len(vuln_details_list)} vulnerability reports to analyze[/bold blue]")
+    
+    # For OpenRouter, check if we need batch processing (for datasets > 100 reports)
+    if (USE_API == "openrouter" and len(vuln_details_list) > 100):
+        console.print("[yellow]Large dataset detected with OpenRouter. Using batch processing.[/yellow]")
+        # Split into manageable batches of 50 reports each
+        return _batch_process_vulnerabilities(vuln_details_list, model)
     
     # Extract richer vulnerability data to improve clustering accuracy
     vuln_data = []
@@ -1196,17 +1217,54 @@ def cluster_vulnerabilities(vuln_details_list, model=DEFAULT_OLLAMA_MODEL):
             
             # Handle different response formats based on API used
             if use_openrouter:
-                if "choices" in result and result["choices"] and len(result["choices"]) > 0:
-                    if "message" in result["choices"][0] and "content" in result["choices"][0]["message"]:
-                        result_text = result["choices"][0]["message"]["content"].strip()
+                try:
+                    # Debug the response structure
+                    console.print(f"[cyan]OpenRouter response keys: {list(result.keys())}[/cyan]")
+                    
+                    # Standard OpenRouter response format
+                    if "choices" in result and result["choices"] and len(result["choices"]) > 0:
+                        # Check and print what's in the first choice
+                        choice = result["choices"][0]
+                        console.print(f"[cyan]OpenRouter choice keys: {list(choice.keys())}[/cyan]")
+                        
+                        if "message" in choice and "content" in choice["message"]:
+                            result_text = choice["message"]["content"].strip()
+                        elif "text" in choice:
+                            # Some models might return text directly
+                            result_text = choice["text"].strip()
+                        else:
+                            # Try to extract content from other possible locations
+                            for possible_key in ["finish_reason", "logprobs", "usage"]:
+                                if possible_key in choice and isinstance(choice[possible_key], str):
+                                    result_text = choice[possible_key].strip()
+                                    break
+                            else:
+                                # If we can't find content in expected places, dump full response for debugging
+                                console.print(f"[yellow]OpenRouter response structure: {json.dumps(result, indent=2)}[/yellow]")
+                                raise ValueError("Cannot find content in OpenRouter response")
+                    # Handle alternative response formats
+                    elif "object" in result and result["object"] == "chat.completion":
+                        if "choices" in result and len(result["choices"]) > 0:
+                            # Try to extract from alternative structure
+                            if "delta" in result["choices"][0] and "content" in result["choices"][0]["delta"]:
+                                result_text = result["choices"][0]["delta"]["content"].strip()
+                            elif "content" in result["choices"][0]:
+                                # Direct content field
+                                result_text = result["choices"][0]["content"].strip()
+                            else:
+                                # Dump structure for debugging
+                                console.print(f"[yellow]OpenRouter chat.completion structure: {json.dumps(result, indent=2)}[/yellow]")
+                                raise ValueError("Cannot find content in chat.completion")
+                    # Direct text response
+                    elif "text" in result:
+                        result_text = result["text"].strip()
+                    # Complete fallback - try to find any text field recursively
                     else:
-                        console.print("[yellow]Invalid OpenRouter response structure. Retrying...[/yellow]")
-                        if attempt < max_retries - 1:
-                            wait_time = base_wait * (2 ** attempt)
-                            time.sleep(wait_time)
-                        continue
-                else:
-                    console.print("[yellow]Invalid OpenRouter response structure. Retrying...[/yellow]")
+                        # Dump full response for debugging
+                        console.print(f"[yellow]Full OpenRouter response: {json.dumps(result, indent=2)}[/yellow]")
+                        raise ValueError("Unrecognized OpenRouter response format")
+                except Exception as e:
+                    console.print(f"[yellow]OpenRouter response processing error: {e}. Retrying...[/yellow]")
                     if attempt < max_retries - 1:
                         wait_time = base_wait * (2 ** attempt)
                         time.sleep(wait_time)
@@ -1412,14 +1470,320 @@ def _deduplicate_library_category(category_data):
     category_data["fixed_examples"] = category_data["fixed_examples"][:3]  # Limit to 3
     category_data["insights"] = category_data["insights"][:3]  # Limit to 3
   
+def _batch_process_vulnerabilities(vuln_details_list, model):
+    """Process a large dataset by splitting it into manageable batches and then combining the results using LLM-based analysis"""
+    # Determine batch size based on provider
+    batch_size = 40  # For OpenRouter, we'll use smaller batches to stay well under the token limit
+    
+    # Split the data into batches
+    batches = []
+    for i in range(0, len(vuln_details_list), batch_size):
+        batches.append(vuln_details_list[i:i+batch_size])
+    
+    console.print(f"[cyan]Processing {len(batches)} batches of ~{batch_size} reports each using LLM analysis[/cyan]")
+    
+    # Process each batch separately using the LLM
+    library = {}
+    for i, batch in enumerate(batches):
+        console.print(f"\n[bold]Processing batch {i+1}/{len(batches)} with LLM...[/bold]")
+        
+        try:
+            # Use the same LLM clustering logic, but on the smaller batch
+            # This avoids the token limit issues while still leveraging LLM capabilities
+            batch_start_time = time.time()
+            
+            # Extract vulnerability data for this batch (similar to cluster_vulnerabilities)
+            vuln_data = []
+            for j, details in enumerate(batch):
+                if not details.get("vuln_type"):
+                    continue
+                    
+                vuln_entry = {
+                    "index": j,  # Local index within this batch
+                    "vuln_type": details.get("vuln_type", "Unknown"),
+                    "severity": details.get("severity_rating", ""),
+                }
+                
+                # Add detection signatures if available
+                if "detection_signatures" in details and details["detection_signatures"]:
+                    if isinstance(details["detection_signatures"], list):
+                        vuln_entry["signatures"] = details["detection_signatures"][:2]
+                    else:
+                        vuln_entry["signatures"] = [str(details["detection_signatures"])]
+                
+                # Add attack vectors if available
+                if "attack_vectors" in details and details["attack_vectors"]:
+                    if isinstance(details["attack_vectors"], list):
+                        vuln_entry["attack_vectors"] = details["attack_vectors"][:2]
+                    else:
+                        vuln_entry["attack_vectors"] = [str(details["attack_vectors"])]
+                        
+                # Include code snippet info (just presence, not full content to save tokens)
+                vuln_entry["has_code_examples"] = bool(details.get("vulnerable_code") or details.get("fixed_code"))
+                
+                vuln_data.append(vuln_entry)
+            
+            # Enhanced clustering prompt - similar to the main function but optimized for smaller batches
+            prompt = """
+            You are a smart contract security expert. Analyze these vulnerability types and organize them into a comprehensive detection library.
+            Examine each vulnerability carefully and determine the logical categories.
+            
+            CLUSTERING RULES:
+            1. Use precise, actionable categories (e.g., "Reentrancy (CWE-841)" instead of just "Logic Error")
+            2. Include CWE identifiers when applicable
+            3. Merge near-identical vulnerabilities even if they have different names
+            4. Keep truly distinct vulnerabilities separate, even if they fall in the same general area
+            5. Prioritize categories that will be most useful for automated vulnerability detection
+            
+            VULNERABILITY DATA:
+            {}
+            
+            OUTPUT INSTRUCTIONS:
+            Return a JSON object where:
+            - Each key is a standardized, precise vulnerability category name (with CWE if possible)
+            - Each value is an array of indices from the input list that belong to this category
+            
+            Example format:
+            {{
+              "Reentrancy (CWE-841)": [0, 3, 7],
+              "Integer Overflow (CWE-190)": [1, 4],
+              "Access Control Issues (CWE-284)": [2, 5, 6]
+            }}
+            
+            Only provide the JSON with no additional explanation.
+            """.format(json.dumps(vuln_data, indent=2))
+            
+            # Note the cached response check is inside the main clustering function
+            
+            # Use OpenRouter for all batches since that's what the user specified
+            use_openrouter = (USE_API == "openrouter")
+            
+            # Generate the clustering response
+            max_retries = 3
+            base_wait = 2  # seconds
+            
+            # Similar to the main clustering logic but simplified
+            for attempt in range(max_retries):
+                try:
+                    if use_openrouter:
+                        # Use OpenRouter API
+                        console.print(f"[cyan]Batch {i+1}: Attempt {attempt+1}/{max_retries} using OpenRouter...[/cyan]")
+                        headers = {
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                            "HTTP-Referer": "https://github.com/pxng0lin/DeepCurrent",
+                            "X-Title": "DeepCurrent Security Analysis"
+                        }
+                        
+                        messages = [
+                            {"role": "system", "content": "You are a smart contract security expert."}, 
+                            {"role": "user", "content": prompt}
+                        ]
+                        
+                        payload = {
+                            "model": DEFAULT_MODEL,
+                            "messages": messages,
+                            "temperature": 0.2,
+                            "max_tokens": 4000  # Reduced max tokens since we're dealing with smaller batches
+                        }
+                        
+                        response = requests.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers=headers,
+                            json=payload,
+                            timeout=120
+                        )
+                    else:
+                        # Use Ollama API
+                        console.print(f"[cyan]Batch {i+1}: Attempt {attempt+1}/{max_retries} using Ollama...[/cyan]")
+                        headers = {"Content-Type": "application/json"}
+                        payload = {
+                            "model": model,
+                            "prompt": prompt,
+                            "temperature": 0.2,
+                            "max_tokens": 4000
+                        }
+                        
+                        response = requests.post(LLM_API_URL, json=payload, headers=headers, timeout=120)
+                    
+                    if response.status_code != 200:
+                        console.print(f"[yellow]HTTP error {response.status_code}. Retrying...[/yellow]")
+                        if attempt < max_retries - 1:
+                            wait_time = base_wait * (2 ** attempt)
+                            time.sleep(wait_time)
+                        continue
+                    
+                    result = response.json()
+                    
+                    # Debug output to help understand the response structure
+                    if use_openrouter:
+                        console.print(f"[dim]OpenRouter response keys: {list(result.keys())}[/dim]")
+                    
+                    # Handle different response formats
+                    if use_openrouter:
+                        try:
+                            # Extract text from OpenRouter response
+                            if "choices" in result and result["choices"] and len(result["choices"]) > 0:
+                                choice = result["choices"][0]
+                                if "message" in choice and "content" in choice["message"]:
+                                    result_text = choice["message"]["content"].strip()
+                                else:
+                                    raise ValueError("Cannot find content in OpenRouter response")
+                            elif "error" in result:
+                                error_msg = result["error"].get("message", "Unknown error")
+                                console.print(f"[red]OpenRouter error: {error_msg}[/red]")
+                                raise ValueError(f"OpenRouter API error: {error_msg}")
+                            else:
+                                raise ValueError("Unrecognized OpenRouter response format") 
+                        except Exception as e:
+                            console.print(f"[yellow]OpenRouter processing error: {e}. Retrying...[/yellow]")
+                            if attempt < max_retries - 1:
+                                wait_time = base_wait * (2 ** attempt)
+                                time.sleep(wait_time)
+                            continue
+                    else:  # Ollama response
+                        if "response" in result:
+                            result_text = result["response"].strip()
+                        else:
+                            console.print("[yellow]Invalid Ollama response structure. Retrying...[/yellow]")
+                            if attempt < max_retries - 1:
+                                wait_time = base_wait * (2 ** attempt)
+                                time.sleep(wait_time)
+                            continue
+                    
+                    # Process and clean the response
+                    # Remove code fences
+                    if result_text.startswith("```") and result_text.endswith("```"):
+                        result_text = "\n".join(result_text.split("\n")[1:-1])
+                    elif result_text.startswith("```"):
+                        result_text = "\n".join(result_text.split("\n")[1:])
+                    
+                    # Remove JSON syntax identifier
+                    if result_text.startswith("json"):
+                        result_text = result_text[4:].lstrip()
+                    
+                    # Extract JSON
+                    if not result_text.startswith("{"):
+                        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                        if json_match:
+                            result_text = json_match.group(0)
+                    
+                    # Parse the clustering
+                    try:
+                        # Use raw_decode to handle potential trailing data
+                        decoder = json.JSONDecoder()
+                        clustering, _ = decoder.raw_decode(result_text)
+                        
+                        if not isinstance(clustering, dict):
+                            raise ValueError("Clustering result is not a dictionary")
+                        
+                        # Process the clustering results for this batch
+                        batch_library = {}
+                        for category in clustering.keys():
+                            batch_library[category] = {
+                                "questions": [], 
+                                "vulnerable_examples": [], 
+                                "fixed_examples": [],
+                                "insights": [], 
+                                "patterns": [], 
+                                "attack_vectors": [], 
+                                "severity_ratings": [],
+                                "detection_signatures": []
+                            }
+                        
+                        # Populate library based on clustering
+                        for category, indices in clustering.items():
+                            for idx in indices:
+                                if isinstance(idx, int) and 0 <= idx < len(batch):
+                                    details = batch[idx]
+                                    _update_library_with_details(batch_library[category], details)
+                        
+                        # Merge this batch's library into the main library
+                        for vuln_type, data in batch_library.items():
+                            if vuln_type not in library:
+                                library[vuln_type] = data
+                            else:
+                                # Merge the data
+                                for key in data:
+                                    library[vuln_type][key].extend(data[key])
+                        
+                        batch_duration = time.time() - batch_start_time
+                        console.print(f"[green]✅ Batch {i+1}/{len(batches)} categorized into {len(batch_library)} vulnerability types in {batch_duration:.1f}s[/green]")
+                        
+                        # Successfully processed this batch
+                        break
+                    except (ValueError, json.JSONDecodeError) as e:
+                        console.print(f"[yellow]Failed to parse batch {i+1} clustering: {e}[/yellow]")
+                        console.print(f"[dim]Result text: {result_text[:100]}...[/dim]")
+                        if attempt < max_retries - 1:
+                            wait_time = base_wait * (2 ** attempt)
+                            time.sleep(wait_time)
+                        continue
+                except Exception as e:
+                    console.print(f"[red]Batch {i+1} processing error: {e}[/red]")
+                    if attempt < max_retries - 1:
+                        wait_time = base_wait * (2 ** attempt)
+                        time.sleep(wait_time)
+                    continue
+            
+            # If we got here and exhausted all retries, use simple categorization for this batch
+            if attempt >= max_retries - 1:
+                console.print(f"[yellow]Could not process batch {i+1} with LLM. Using simple categorization.[/yellow]")
+                # Simple categorization fallback
+                batch_library = {}
+                for details in batch:
+                    vuln_type = details.get("vuln_type", "Unknown")
+                    if not vuln_type or vuln_type == "Unknown":
+                        continue
+                    
+                    if vuln_type not in batch_library:
+                        batch_library[vuln_type] = {
+                            "questions": [], 
+                            "vulnerable_examples": [], 
+                            "fixed_examples": [],
+                            "insights": [], 
+                            "patterns": [], 
+                            "attack_vectors": [], 
+                            "severity_ratings": [],
+                            "detection_signatures": []
+                        }
+                    
+                    # Add all details to the library
+                    _update_library_with_details(batch_library[vuln_type], details)
+                
+                # Merge this batch's library into the main library
+                for vuln_type, data in batch_library.items():
+                    if vuln_type not in library:
+                        library[vuln_type] = data
+                    else:
+                        # Merge the data
+                        for key in data:
+                            library[vuln_type][key].extend(data[key])
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Batch processing interrupted. Using partial results.[/yellow]")
+            break
+        except Exception as e:
+            console.print(f"\n[red]Error processing batch {i+1}: {e}[/red]")
+            # Continue with next batch
+    
+    # Final deduplication and cleanup
+    for category_data in library.values():
+        _deduplicate_library_category(category_data)
+    
+    console.print(f"\n[green]✅ Successfully processed {len(vuln_details_list)} reports into {len(library)} vulnerability categories using LLM-powered batch processing[/green]")
+    return library
+
 def format_examples(examples):
     """Convert a list of examples (which may be dicts) into a formatted string."""
+    if not examples:
+        return ""
+        
     formatted = []
-    for ex in examples:
+    for i, ex in enumerate(examples):
         if isinstance(ex, dict):
-            formatted.append(json.dumps(ex, indent=2))
+            formatted.append(f"Example {i+1}: {json.dumps(ex, indent=2)}")
         else:
-            formatted.append(str(ex))
+            formatted.append(f"Example {i+1}: {ex}")
     return "\n".join(formatted)
 
 def display_detection_library(library):
