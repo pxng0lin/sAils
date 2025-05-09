@@ -1,4 +1,4 @@
-# 📄 README.md — Updated with LLM-Enhanced Vulnerability Detection
+# 📄 README.md — Multiple enhancements
 
 <p align="center">
   <img src="sAils_logo_small.png" alt="sAils Logo" width="200"/>
