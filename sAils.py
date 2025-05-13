@@ -1155,9 +1155,12 @@ def main():
         if not args.contracts and not (args.reports or args.docs):
             parser.error("--contracts, --reports, or --docs is required unless --watch is used.")
 
+        # Ensure contract_dir is a string even when None
+        contract_dir = args.contracts if args.contracts is not None else ""
+        
         vuln_pipeline(
             report_urls=args.reports,
-            contract_dir=args.contracts,
+            contract_dir=contract_dir,
             doc_paths=args.docs,
             session_folder=session,
             llm_provider=args.llm_provider,
