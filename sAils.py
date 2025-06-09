@@ -21,6 +21,7 @@
 # ///
 
 import os
+import sys
 import argparse
 import asyncio
 import time
@@ -30,8 +31,7 @@ import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
-
-
+import json
 
 # Ensure DB paths are resolved relative to where the script file lives (not where it's run from)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,7 +49,7 @@ from prefect import task, flow
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from VectorEyes import process_markdown_file, init_db as init_vector_db, build_detection_library
+from VectorEyes import process_markdown_file, process_single_file, process_repo, process_web_portfolio, init_db as init_vector_db, build_detection_library, generate_structured_analysis
 from DeepCurrent import (
     init_db as init_deep_db,
     process_contracts_parallel,
@@ -75,12 +75,147 @@ def ingest_reports(report_urls: List[str]):
     if not report_urls:
         print("No reports provided, skipping ingestion.")
         return 0
+    
+    ingested_count = 0
     for url in report_urls:
-        process_markdown_file(url, url)
-    return len(report_urls)
+        print(f"Processing report source: {url}")
+        if "github.com" in url:
+            if "/tree/" in url or "/blob/" in url:
+                # This is a GitHub repository or directory
+                print(f"Detected GitHub repository or directory: {url}")
+                process_repo(url, skip_analysis=True)
+            else:
+                # This is a GitHub file or other URL
+                print(f"Detected GitHub file or other URL: {url}")
+                process_single_file(url, skip_analysis=True)
+        elif "/portfolio" in url or any(term in url for term in ['/reports', '/audits', '/findings', '/security']):
+            # This looks like a portfolio or reports page
+            print(f"Detected web portfolio: {url}")
+            # Process all reports from the web portfolio
+            portfolio_count = process_web_portfolio(url, skip_analysis=True)
+            ingested_count += portfolio_count
+            continue  # Skip the increment below as we already counted the reports
+        else:
+            # Regular URL or file path
+            print(f"Processing as regular URL or file path: {url}")
+            process_markdown_file(url, url, skip_analysis=True)
+        ingested_count += 1
+    
+    # Get actual count of reports from database
+    try:
+        conn = sqlite3.connect(VECTOR_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM reports")
+        db_count = cur.fetchone()[0]
+        conn.close()
+        print(f"Total reports in database: {db_count}")
+    except Exception as e:
+        print(f"Error counting reports in database: {e}")
+        db_count = ingested_count
+    
+    return db_count
 
 @task
-def build_vuln_library(report_count: int):
+def ingest_web_portfolio(url: str, site_type: str = "auto"):
+    """Task to ingest vulnerability reports from a web portfolio.
+    
+    Args:
+        url: URL of the portfolio page
+        site_type: Type of site ('cantina', 'generic', or 'auto' for automatic detection)
+    """
+    print(f"Ingesting reports from web portfolio: {url} (site type: {site_type})")
+    count = process_web_portfolio(url, skip_analysis=True, site_type=site_type)
+    return count
+
+@task
+def analyze_reports(report_ids: List[str] = None, llm_provider: str = None, openrouter_key: str = None, openrouter_model: str = None, ollama_model: str = None):
+    """Task to analyze reports with LLM.
+    
+    Args:
+        report_ids: List of report IDs to analyze. If None, analyzes all reports without analysis.
+        llm_provider: LLM provider to use ('ollama' or 'openrouter')
+        openrouter_key: OpenRouter API key
+        openrouter_model: OpenRouter model to use
+        ollama_model: Ollama model to use
+    """
+    if not report_ids:
+        # If no specific reports are provided, analyze all reports that don't have analysis
+        conn = sqlite3.connect(VECTOR_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM reports WHERE analysis_summary IS NULL OR analysis_summary = '{}' OR analysis_summary = ''")
+        report_ids = [row[0] for row in cur.fetchall()]
+        conn.close()
+        
+    if not report_ids:
+        print("No reports to analyze.")
+        return 0
+    
+    print(f"[INFO] Found {len(report_ids)} reports that need analysis.")
+    analyzed_count = 0
+    for report_id in report_ids:
+        print(f"[INFO] Analyzing report {report_id}...")
+        try:
+            # Get the report content from the database
+            conn = sqlite3.connect(VECTOR_DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT content FROM reports WHERE id = ?", (report_id,))
+            result = cur.fetchone()
+            conn.close()
+            
+            if not result:
+                print(f"[ERROR] Report {report_id} not found in database")
+                continue
+                
+            content = result[0]
+            
+            # Set up model parameters based on provider
+            model_to_use = None
+            
+            if llm_provider == "openrouter" and openrouter_key and openrouter_model:
+                # Configure VectorEyes to use OpenRouter
+                print(f"Using OpenRouter API with model: {openrouter_model}")
+                # Set environment variables for VectorEyes
+                os.environ["OPENROUTER_API_KEY"] = openrouter_key
+                os.environ["USE_API"] = "openrouter"
+                os.environ["DEFAULT_MODEL"] = openrouter_model
+                
+                # Import and configure VectorEyes directly
+                from VectorEyes import set_openrouter_api_key, set_api_preference
+                set_openrouter_api_key(openrouter_key)
+                set_api_preference("openrouter")
+                
+                model_to_use = openrouter_model
+            elif llm_provider == "ollama" and ollama_model:
+                # Use specified Ollama model
+                print(f"Using local Ollama API with model: {ollama_model}")
+                os.environ["USE_API"] = "ollama"
+                model_to_use = ollama_model
+            else:
+                # Default to local Ollama model
+                print(f"Using local Ollama API with model: deepseek-r1:32b")
+                os.environ["USE_API"] = "ollama"
+                model_to_use = "deepseek-r1:32b"
+                
+            analysis_summary = generate_structured_analysis(content, model=model_to_use)
+            pattern = analysis_summary.get("pattern", "N/A")
+            
+            conn = sqlite3.connect(VECTOR_DB_PATH)
+            cur = conn.cursor()
+            cur.execute("UPDATE reports SET analysis_summary = ? WHERE id = ?", 
+                       (json.dumps(analysis_summary), report_id))
+            cur.execute("INSERT OR REPLACE INTO patterns (report_id, pattern) VALUES (?, ?)", 
+                       (report_id, pattern))
+            conn.commit()
+            conn.close()
+            analyzed_count += 1
+        except Exception as e:
+            print(f"[ERROR] Failed to analyze report {report_id}: {e}")
+    
+    print(f"[INFO] Completed analysis of {analyzed_count} reports.")
+    return analyzed_count
+
+@task
+def build_vuln_library(report_count: int, analyzed_count: int):
     try:
         conn = sqlite3.connect(VECTOR_DB_PATH)
         cur = conn.cursor()
@@ -94,8 +229,8 @@ def build_vuln_library(report_count: int):
         print(f"[ERROR] Could not check detection_library table: {e}")
         return False
 
-    if report_count <= 0:
-        print("[WARN] No new reports ingested this session and detection library is empty.")
+    if report_count <= 0 and analyzed_count <= 0:
+        print("[WARN] No reports ingested or analyzed this session and detection library is empty.")
         return False
 
     return build_detection_library()
@@ -170,7 +305,10 @@ def vuln_pipeline(
     openrouter_key: Optional[str] = None,
     openrouter_model: Optional[str] = None,
     ollama_model: Optional[str] = None,
-    run_vuln_scan: bool = False
+    run_vuln_scan: bool = False,
+    analyze_ingested_reports: bool = False,
+    web_portfolio: Optional[str] = None,
+    site_type: str = "auto"
 ):
     provider = llm_provider or DEFAULT_LLM_PROVIDER
     print(f"Using LLM provider: {provider}")
@@ -180,14 +318,40 @@ def vuln_pipeline(
     else:
         model = ollama_model or DEFAULT_OLLAMA_MODEL
 
+    # Step 1: Initialize databases and ingest reports (vectorization only)
     initialize_databases()
     ingested = ingest_reports(report_urls)
-    built = build_vuln_library(ingested)
+    
+    # Step 1b: Ingest web portfolio reports if specified
+    portfolio_ingested = 0
+    if web_portfolio:
+        print(f"[INFO] Ingesting reports from web portfolio: {web_portfolio} (site type: {site_type})")
+        portfolio_ingested = ingest_web_portfolio(web_portfolio, site_type=site_type)
+    
+    # Step 2: Analyze reports with LLM (optional)
+    analyzed_reports = 0
+    if analyze_ingested_reports:
+        print("[INFO] Starting analysis of ingested reports...")
+        analyzed_reports = analyze_reports(
+            llm_provider=llm_provider,
+            openrouter_key=openrouter_key,
+            openrouter_model=openrouter_model,
+            ollama_model=ollama_model
+        )
+    else:
+        print("[INFO] Skipping report analysis (use --analyze-reports flag to enable)")
+    
+    # Step 3: Build vulnerability library based on analyzed reports
+    built = build_vuln_library(ingested, analyzed_reports)
+    
+    # Step 4: Process contracts and documents
     analyzed = scan_contracts(contract_dir, session_folder)
     docs = analyze_docs(doc_paths, session_folder)
     vuln_results = vuln_scan(session_folder) if run_vuln_scan else False
 
-    ask_questions_about_analysis(session_folder)
+    # Only run this if there's contract analysis data
+    if analyzed > 0:
+        ask_questions_about_analysis(session_folder)
 
     context = gather_analysis_context(session_folder, [], [])
     auto_questions = [
@@ -226,14 +390,26 @@ def vuln_pipeline(
             for question, answer in futures:
                 f.write(f"### Q: {question}\n\n{answer}\n\n---\n")
 
-    notify({
-        "reports_ingested": ingested,
-        "library_built": built,
-        "contracts_analyzed": analyzed,
-        "docs_analyzed": docs,
-        "vulnerabilities_scanned": vuln_results,
-        "session_folder": session_folder
-    })
+    summary = {
+        "reports": ingested,
+        "contracts": analyzed,
+        "docs": docs,
+        "vuln_scan": vuln_results,
+        "timestamp": datetime.now().isoformat()
+    }
+    notify(summary)
+    
+    # Return a dictionary with all the relevant counts for the main function
+    return {
+        "ingested_count": ingested + portfolio_ingested,  # Total ingested reports
+        "github_ingested": ingested,  # Reports from GitHub
+        "portfolio_ingested": portfolio_ingested,  # Reports from web portfolio
+        "analyzed_count": analyzed_reports,
+        "contracts_count": analyzed,
+        "docs_count": docs,
+        "vuln_scan": vuln_results,
+        "timestamp": datetime.now().isoformat()
+    }
 
 WATCHED_DIR = None
 
@@ -297,6 +473,8 @@ def main():
     from datetime import datetime  # Import datetime at the function level
     parser = argparse.ArgumentParser(description='Run the sAils AI agent for smart contract and documentation analysis.')
     parser.add_argument("--reports", nargs="+", default=[], help="List of report URLs or file paths.")
+    parser.add_argument("--web-portfolio", help="URL to a web portfolio for vulnerability report ingestion (e.g., https://cantina.xyz/portfolio).")
+    parser.add_argument("--site-type", choices=["auto", "cantina", "generic"], default="auto", help="Type of site to scrape ('cantina', 'generic', or 'auto' for automatic detection).")
     parser.add_argument("--contracts", help="Directory or single file containing contract(s).")
     parser.add_argument("--docs", nargs="*", default=[], help="List of doc paths/URLs (pdf, md, url).")
     parser.add_argument("--session", help="Session name (will be stored in centralized sessions directory)")
@@ -311,6 +489,8 @@ def main():
     parser.add_argument("--vuln-scan", action="store_true", help="Run vulnerability scanning on the analyzed contracts.")
     parser.add_argument("--watch", action="store_true", help="Watch a folder for new contract directories.")
     parser.add_argument("--vuln-scan-only", action="store_true", help="Only run vulnerability scan on given session or contracts.")
+    parser.add_argument("--analyze-reports", action="store_true", help="Analyze ingested reports with LLM (separate from ingestion).")
+    parser.add_argument("--analyze-specific-reports", nargs="+", help="Analyze specific reports by their IDs with LLM.")
     
     # Additional options from DeepCurrent and VectorEyes
     parser.add_argument("--test-llm-connection", action="store_true", help="Test connection to the LLM provider and display available models.")
@@ -426,6 +606,19 @@ def main():
         # Configure VectorEyes to use Ollama
         VectorEyes.USE_API = "ollama"
         VectorEyes.DEFAULT_OLLAMA_MODEL = args.ollama_model or DEFAULT_OLLAMA_MODEL
+    
+    # Handle specific report analysis
+    if args.analyze_specific_reports:
+        print(f"[INFO] Analyzing specific reports by IDs: {args.analyze_specific_reports}")
+        analyzed_count = analyze_reports(
+            report_ids=args.analyze_specific_reports,
+            llm_provider=args.llm_provider,
+            openrouter_key=args.openrouter_key,
+            openrouter_model=args.openrouter_model,
+            ollama_model=args.ollama_model
+        )
+        print(f"[INFO] Completed analysis of {analyzed_count} specific reports.")
+        return
     
     # Handle LLM enhancement options
     if args.enhance_library or args.semantic_search or args.llm_prompt:
@@ -1152,23 +1345,71 @@ def main():
         WATCHED_DIR = Prompt.ask("Enter the directory path to watch for new folders (e.g., ~/Documents/web3/*)")
         watch_for_new_dirs()
     else:
-        if not args.contracts and not (args.reports or args.docs):
-            parser.error("--contracts, --reports, or --docs is required unless --watch is used.")
+        if not args.contracts and not (args.reports or args.docs or args.web_portfolio):
+            parser.error("--contracts, --reports, --web-portfolio, or --docs is required unless --watch is used.")
 
         # Ensure contract_dir is a string even when None
         contract_dir = args.contracts if args.contracts is not None else ""
         
-        vuln_pipeline(
-            report_urls=args.reports,
-            contract_dir=contract_dir,
-            doc_paths=args.docs,
-            session_folder=session,
-            llm_provider=args.llm_provider,
-            openrouter_key=args.openrouter_key,
-            openrouter_model=args.openrouter_model,
-            ollama_model=args.ollama_model,
-            run_vuln_scan=args.vuln_scan
-        )
+        try:
+            # Run the pipeline
+            result = vuln_pipeline(
+                report_urls=args.reports,
+                contract_dir=contract_dir,
+                doc_paths=args.docs,
+                session_folder=session,
+                llm_provider=args.llm_provider,
+                openrouter_key=args.openrouter_key,
+                openrouter_model=args.openrouter_model,
+                ollama_model=args.ollama_model,
+                run_vuln_scan=args.vuln_scan,
+                analyze_ingested_reports=args.analyze_reports,
+                web_portfolio=args.web_portfolio,
+                site_type=args.site_type
+            )
+            
+            # Print a completion message
+            print("\n[INFO] Pipeline execution completed.")
+            if args.reports or args.web_portfolio:
+                print(f"[INFO] Total reports processed: {result['ingested_count']}")
+                if args.reports:
+                    print(f"[INFO] GitHub reports processed: {result['github_ingested']}")
+                if args.web_portfolio:
+                    print(f"[INFO] Web portfolio reports processed: {result['portfolio_ingested']}")
+                if args.analyze_reports:
+                    print(f"[INFO] Reports analyzed: {result['analyzed_count']}")
+
+            if args.contracts:
+                print(f"[INFO] Contracts processed: {result['contracts_count']}")
+            if args.docs:
+                print(f"[INFO] Documents analyzed: {result['docs_count']}")
+                
+            print("\n[INFO] To analyze more content, run the command again with different parameters.")
+            
+        except Exception as e:
+            print(f"\n[ERROR] Pipeline execution failed: {e}")
+        finally:
+            # Make sure to shut down the Prefect server
+            print("\n[INFO] Shutting down services...")
+            # Find and kill any Prefect processes
+            try:
+                import signal
+                import psutil
+                for proc in psutil.process_iter(['pid', 'name']):
+                    if 'prefect' in proc.info['name'].lower():
+                        print(f"[INFO] Terminating Prefect process: {proc.info['pid']}")
+                        try:
+                            os.kill(proc.info['pid'], signal.SIGTERM)
+                        except Exception as e:
+                            print(f"[WARN] Failed to terminate process: {e}")
+            except ImportError:
+                print("[WARN] psutil not available, cannot terminate Prefect processes")
+            except Exception as e:
+                print(f"[WARN] Error while terminating processes: {e}")
+                
+            # Force exit to ensure all processes are terminated
+            print("[INFO] Exiting...")
+            os._exit(0)
 
 if __name__ == "__main__":
     main()

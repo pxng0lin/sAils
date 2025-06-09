@@ -36,6 +36,8 @@ from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ollama  # Import the ollama-python client
+from bs4 import BeautifulSoup  # For parsing HTML content
+import json
 
 # Simplified API key management (session-only, not saved to disk)
 # No longer using external api_keys module for more secure API key handling
@@ -277,10 +279,36 @@ except Exception as e:
 # Use API key management system if available
 # Session-based API key management
 # Initialize from environment variables or use defaults
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-USE_API = os.getenv("USE_API", "auto").lower()
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek/deepseek-r1-distill-llama-70b:free")
-DEFAULT_OLLAMA_MODEL = os.getenv("DEFAULT_OLLAMA_MODEL", "deepseek-r1:32b")
+USE_API = os.environ.get("USE_API", "auto")  # auto, ollama, openrouter
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_DATA_USAGE = os.environ.get("OPENROUTER_DATA_USAGE", "opt-out-from-training")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "anthropic/claude-3-haiku")
+DEFAULT_OLLAMA_MODEL = os.environ.get("DEFAULT_OLLAMA_MODEL", "deepseek-r1:32b")
+BACKUP_MODELS = ["deepseek/deepseek-v3-base:free", "meta-llama/llama-3-8b-instruct:free", "mistralai/mistral-7b-instruct-v0.2:free"]
+
+# Helper functions to set API configuration
+def set_openrouter_api_key(api_key):
+    """Set the OpenRouter API key globally."""
+    global OPENROUTER_API_KEY
+    OPENROUTER_API_KEY = api_key
+    os.environ["OPENROUTER_API_KEY"] = api_key
+    
+def set_api_preference(preference):
+    """Set the API preference globally (auto, ollama, or openrouter)."""
+    global USE_API
+    if preference in ["auto", "ollama", "openrouter"]:
+        USE_API = preference
+        os.environ["USE_API"] = preference
+    else:
+        console.print(f"[yellow]Invalid API preference: {preference}. Using 'auto'.[/yellow]")
+        USE_API = "auto"
+        os.environ["USE_API"] = "auto"
+        
+def set_default_model(model_name):
+    """Set the default model globally."""
+    global DEFAULT_MODEL
+    DEFAULT_MODEL = model_name
+    os.environ["DEFAULT_MODEL"] = model_name
 
 # OpenRouter API URL and data policy setting
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -488,112 +516,155 @@ def _generate_with_openrouter(extraction_prompt, report, model, cache_key):
                 else:
                     response.raise_for_status()
             
-            # Process successful response
+            # Parse the response
+            response_data = response.json()
+            console.print(f"Using model: {current_model}")
+            
+            # Extract the response text
             try:
-                result = response.json()
+                response_text = response_data['choices'][0]['message']['content']
+                console.print(f"Response received ({len(response_text)} chars)")
                 
-                # Log model information if available
-                if "model" in result:
-                    console.print(f"[dim]Using model: {result['model']}[/dim]")
-                
-                # Validate response structure
-                if not isinstance(result, dict):
-                    console.print(f"[yellow]Unexpected response type: {type(result)}[/yellow]")
-                    raise ValueError(f"Unexpected response type: {type(result)}")
-                    
-                if "choices" not in result or not result["choices"] or not isinstance(result["choices"], list):
-                    console.print(f"[yellow]Invalid response format - missing choices: {result}[/yellow]")
-                    raise ValueError("Invalid API response format - missing choices")
-                    
-                # Extract the content from the response
-                choice = result["choices"][0]
-                if "message" not in choice:
-                    console.print(f"[yellow]No 'message' in response choice: {choice}[/yellow]")
-                    raise ValueError("No 'message' in API response")
-                    
-                message = choice["message"]
-                if "content" not in message:
-                    console.print(f"[yellow]No 'content' in message: {message}[/yellow]")
-                    raise ValueError("No 'content' in API response message")
-                    
-                text = message["content"].strip()
-                console.print(f"[dim]Response received ({len(text)} chars)[/dim]")
-                
-                if not text:
-                    raise ValueError("Empty response from API")
-                
-                # Extract JSON from text if needed
-                if text.startswith("{"): 
-                    parsed_data = json.loads(text)
-                else:
-                    # Look for JSON pattern { ... }
-                    json_match = re.search(r'\{[^{]*"vuln_type".*\}', text, re.DOTALL)
-                    if json_match:
-                        try:
-                            parsed_data = json.loads(json_match.group(0))
-                        except json.JSONDecodeError:
-                            raise ValueError("Failed to parse JSON after multiple attempts")
-                    else:
-                        # Try to parse structured info from markdown-formatted response
-                        console.print("[yellow]No JSON found, attempting to extract structured information from markdown...[/yellow]")
-                        extracted_info = extract_structured_info_from_markdown(text)
-                        if extracted_info and extracted_info["vuln_type"] != "Unknown":
-                            console.print("[green]Successfully extracted structured information from markdown[/green]")
-                            parsed_data = extracted_info
-                        else:
-                            raise ValueError("No structured information found in the response")
-            except Exception as e:
-                console.print(f"[yellow]Failed to parse response: {str(e)}[/yellow]")
-                raise ValueError(f"Invalid API response format: {str(e)}")
-                # Cache the result and ensure fields are structured correctly
+                # Try to parse the JSON response
                 try:
-                    # Ensure all expected fields exist with default values if missing
-                    expected_fields = [
-                        "vuln_type", "severity_rating", "questions", "vulnerable_code", 
-                        "fixed_code", "researcher_insights", "attack_vectors", 
-                        "detection_signatures", "pattern"
-                    ]
+                    # Find JSON content in the response using multiple strategies
+                    # Strategy 1: Look for JSON in code blocks
+                    json_match = re.search(r'```(?:json)?\s*({[\s\S]*?})\s*```', response_text)
+                    if json_match:
+                        json_str = json_match.group(1)
+                        try:
+                            result = json.loads(json_str)
+                            console.print(f"[green]Successfully extracted JSON from code block[/green]")
+                        except json.JSONDecodeError:
+                            console.print(f"[yellow]Failed to parse JSON from code block, trying other methods[/yellow]")
+                            json_match = None
                     
-                    for field in expected_fields:
-                        if field not in parsed_data:
-                            if field in ["questions", "attack_vectors", "detection_signatures"]:
-                                parsed_data[field] = []
-                            else:
-                                parsed_data[field] = ""
+                    # Strategy 2: Look for JSON between curly braces
+                    if not json_match:
+                        # Find the first { and the last } that might form a complete JSON object
+                        start_idx = response_text.find('{')
+                        end_idx = response_text.rfind('}')
+                        
+                        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+                            json_str = response_text[start_idx:end_idx+1]
+                            try:
+                                result = json.loads(json_str)
+                                console.print(f"[green]Successfully extracted JSON using brace matching[/green]")
+                            except json.JSONDecodeError:
+                                # Try to find the largest valid JSON object
+                                console.print(f"[yellow]Failed with simple brace matching, trying advanced extraction[/yellow]")
+                                
+                                # Try to find valid JSON by incrementally parsing
+                                valid_json = None
+                                for i in range(end_idx, start_idx, -1):
+                                    try:
+                                        test_str = response_text[start_idx:i+1]
+                                        valid_json = json.loads(test_str)
+                                        console.print(f"[green]Found valid JSON substring[/green]")
+                                        break
+                                    except json.JSONDecodeError:
+                                        continue
+                                
+                                if valid_json:
+                                    result = valid_json
+                                else:
+                                    # Last resort: try to parse the entire response
+                                    try:
+                                        result = json.loads(response_text)
+                                    except json.JSONDecodeError as e:
+                                        raise json.JSONDecodeError(f"Could not extract valid JSON using any method: {e}", e.doc, e.pos)
                     
-                    # Ensure list fields are actually lists
-                    list_fields = ["questions", "attack_vectors", "detection_signatures"]
-                    for field in list_fields:
-                        if not isinstance(parsed_data[field], list):
-                            if parsed_data[field]:  # If it has a value but isn't a list
-                                parsed_data[field] = [parsed_data[field]]
-                            else:
-                                parsed_data[field] = []
-                    
-                    # Cache the result
-                    with open(cache_file, 'w') as f:
-                        json.dump(parsed_data, f, indent=2)
-                    console.print(f"[dim]Cached analysis result to {cache_file}[/dim]")
-                    
-                    return parsed_data
-                except Exception as e:
-                    console.print(f"[yellow]Failed to process or cache result: {e}[/yellow]")
-                    raise ValueError(f"Failed to process response: {str(e)}")
+                    # Validate that we have the expected fields
+                    expected_fields = ["vuln_type", "severity_rating", "pattern"]
+                    if all(field in result for field in expected_fields):
+                        # Write the result to cache
+                        with open(cache_file, 'w') as f:
+                            json.dump(result, f)
+                        
+                        console.print(f"[green]Successfully parsed JSON response with all required fields[/green]")
+                        return result
+                    else:
+                        missing_fields = [field for field in expected_fields if field not in result]
+                        console.print(f"[yellow]Response missing required fields: {missing_fields}[/yellow]")
+                        
+                        if attempt < max_retries - 1:
+                            wait_time = base_wait * (2 ** attempt)
+                            console.print(f"[yellow]Retrying with different model in {wait_time} seconds...[/yellow]")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            # Last attempt, add missing fields with default values
+                            for field in missing_fields:
+                                result[field] = "Unknown" if field != "pattern" else ""
+                            
+                            # Write the result to cache
+                            with open(cache_file, 'w') as f:
+                                json.dump(result, f)
+                            
+                            console.print(f"[yellow]Using partial result with added default values for missing fields[/yellow]")
+                            return result
+                except (json.JSONDecodeError, TypeError) as e:
+                    console.print(f"[yellow]Failed to parse JSON response: {e}[/yellow]")
+                    if attempt < max_retries - 1:
+                        wait_time = base_wait * (2 ** attempt)
+                        console.print(f"[yellow]Retrying with different model in {wait_time} seconds...[/yellow]")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        # Last attempt, create a basic structure with the raw text
+                        console.print(f"[yellow]Creating fallback result structure with raw text[/yellow]")
+                        result = {
+                            "vuln_type": "Unknown",
+                            "severity_rating": "Unknown",
+                            "questions": [],
+                            "vulnerable_code": "",
+                            "fixed_code": "",
+                            "researcher_insights": response_text[:500],
+                            "attack_vectors": [],
+                            "detection_signatures": [],
+                            "pattern": ""
+                        }
+                        with open(cache_file, 'w') as f:
+                            json.dump(result, f)
+                        return result
+            except (KeyError, IndexError) as e:
+                console.print(f"[yellow]Failed to extract response text: {e}[/yellow]")
+                if attempt < max_retries - 1:
+                    wait_time = base_wait * (2 ** attempt)
+                    console.print(f"[yellow]Retrying with different model in {wait_time} seconds...[/yellow]")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise Exception(f"Failed to extract response text after {max_retries} attempts")
                     
         except requests.RequestException as e:
             console.print(f"[yellow]Request error on attempt {attempt+1}: {e}[/yellow]")
+            if attempt < max_retries - 1:
+                wait_time = base_wait * (2 ** attempt)
+                console.print(f"[yellow]Retrying in {wait_time} seconds...[/yellow]")
+                time.sleep(wait_time)
+                continue
         except json.JSONDecodeError as e:
             console.print(f"[yellow]JSON decode error on attempt {attempt+1}: {e}[/yellow]")
+            if attempt < max_retries - 1:
+                wait_time = base_wait * (2 ** attempt)
+                console.print(f"[yellow]Retrying in {wait_time} seconds...[/yellow]")
+                time.sleep(wait_time)
+                continue
         except ValueError as e:
             console.print(f"[yellow]Value error on attempt {attempt+1}: {e}[/yellow]")
+            if attempt < max_retries - 1:
+                wait_time = base_wait * (2 ** attempt)
+                console.print(f"[yellow]Retrying in {wait_time} seconds...[/yellow]")
+                time.sleep(wait_time)
+                continue
         except Exception as e:
             console.print(f"[red]Unexpected error on attempt {attempt+1}: {e}[/red]")
-        
-        # Don't wait after the last attempt
-        if attempt < max_retries - 1:
-            wait_time = base_wait * (2 ** attempt)
-            console.print(f"[yellow]Retrying in {wait_time} seconds...[/yellow]")
-            time.sleep(wait_time)
+            if attempt < max_retries - 1:
+                wait_time = base_wait * (2 ** attempt)
+                console.print(f"[yellow]Retrying in {wait_time} seconds...[/yellow]")
+                time.sleep(wait_time)
+                continue
     
     # If we get here, all attempts failed
     raise Exception("Failed to get a valid response from OpenRouter after multiple attempts")
@@ -669,24 +740,90 @@ def _generate_with_ollama(extraction_prompt, report, model, cache_key):
                 console.print(f"[yellow]Error with Ollama response: {str(e)}[/yellow]")
                 raise
             
-            # Try to extract JSON from text
+            # Try to extract JSON from text using multiple strategies
             try:
+                # Strategy 1: Direct JSON parsing if response starts with {
                 if text.startswith("{"):
-                    parsed_data = json.loads(text)
+                    try:
+                        parsed_data = json.loads(text)
+                        console.print("[green]Successfully parsed direct JSON response[/green]")
+                    except json.JSONDecodeError:
+                        console.print("[yellow]Response starts with { but is not valid JSON, trying other methods[/yellow]")
+                        raise
                 else:
-                    # Try to find JSON in the response
-                    json_match = re.search(r'\{[^{]*"vuln_type".*\}', text, re.DOTALL)
+                    # Strategy 2: Look for JSON in code blocks
+                    json_match = re.search(r'```(?:json)?\s*({[\s\S]*?})\s*```', text)
                     if json_match:
-                        parsed_data = json.loads(json_match.group(0))
-                    else:
-                        # Try markdown extraction as a last resort
-                        console.print("[yellow]No JSON found, attempting to extract structured information from markdown...[/yellow]")
-                        extracted_info = extract_structured_info_from_markdown(text)
-                        if extracted_info and extracted_info["vuln_type"] != "Unknown":
-                            console.print("[green]Successfully extracted structured information from markdown[/green]")
-                            parsed_data = extracted_info
+                        json_str = json_match.group(1)
+                        try:
+                            parsed_data = json.loads(json_str)
+                            console.print("[green]Successfully extracted JSON from code block[/green]")
+                        except json.JSONDecodeError:
+                            console.print("[yellow]Failed to parse JSON from code block, trying other methods[/yellow]")
+                            json_match = None
+                    
+                    # Strategy 3: Look for JSON between curly braces
+                    if not json_match:
+                        # Find the first { and the last } that might form a complete JSON object
+                        start_idx = text.find('{')
+                        end_idx = text.rfind('}')
+                        
+                        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+                            json_str = text[start_idx:end_idx+1]
+                            try:
+                                parsed_data = json.loads(json_str)
+                                console.print("[green]Successfully extracted JSON using brace matching[/green]")
+                            except json.JSONDecodeError:
+                                # Try to find the largest valid JSON object
+                                console.print("[yellow]Failed with simple brace matching, trying advanced extraction[/yellow]")
+                                
+                                # Try to find valid JSON by incrementally parsing
+                                valid_json = None
+                                for i in range(end_idx, start_idx, -1):
+                                    try:
+                                        test_str = text[start_idx:i+1]
+                                        valid_json = json.loads(test_str)
+                                        console.print("[green]Found valid JSON substring[/green]")
+                                        break
+                                    except json.JSONDecodeError:
+                                        continue
+                                
+                                if valid_json:
+                                    parsed_data = valid_json
+                                else:
+                                    # Strategy 4: Try to find JSON with vuln_type field
+                                    json_match = re.search(r'\{[^{]*"vuln_type".*\}', text, re.DOTALL)
+                                    if json_match:
+                                        try:
+                                            parsed_data = json.loads(json_match.group(0))
+                                            console.print("[green]Found JSON with vuln_type field[/green]")
+                                        except json.JSONDecodeError:
+                                            # Try markdown extraction as a last resort
+                                            console.print("[yellow]No valid JSON found, attempting to extract structured information from markdown...[/yellow]")
+                                            extracted_info = extract_structured_info_from_markdown(text)
+                                            if extracted_info and extracted_info["vuln_type"] != "Unknown":
+                                                console.print("[green]Successfully extracted structured information from markdown[/green]")
+                                                parsed_data = extracted_info
+                                            else:
+                                                raise ValueError("Failed to extract structured data from response")
+                                    else:
+                                        # Try markdown extraction as a last resort
+                                        console.print("[yellow]No JSON found, attempting to extract structured information from markdown...[/yellow]")
+                                        extracted_info = extract_structured_info_from_markdown(text)
+                                        if extracted_info and extracted_info["vuln_type"] != "Unknown":
+                                            console.print("[green]Successfully extracted structured information from markdown[/green]")
+                                            parsed_data = extracted_info
+                                        else:
+                                            raise ValueError("Failed to extract structured data from response")
                         else:
-                            raise ValueError("Failed to extract structured data from response")
+                            # Try markdown extraction as a last resort
+                            console.print("[yellow]No JSON found, attempting to extract structured information from markdown...[/yellow]")
+                            extracted_info = extract_structured_info_from_markdown(text)
+                            if extracted_info and extracted_info["vuln_type"] != "Unknown":
+                                console.print("[green]Successfully extracted structured information from markdown[/green]")
+                                parsed_data = extracted_info
+                            else:
+                                raise ValueError("Failed to extract structured data from response")
                 
                 # Ensure all expected fields exist with default values if missing
                 expected_fields = [
@@ -745,9 +882,437 @@ def _generate_with_ollama(extraction_prompt, report, model, cache_key):
         "raw_analysis": "LLM analysis failed after multiple attempts."
     }
 
+# ---------------------- Web Portfolio Functions ----------------------
+def process_web_portfolio(url="https://cantina.xyz/portfolio", model_instance=None, skip_analysis=False, max_reports=None, site_type="auto"):
+    """
+    Scrape and process vulnerability reports from the Cantina portfolio page.
+    
+    Args:
+        url: URL of the Cantina portfolio page (default: https://cantina.xyz/portfolio)
+        model_instance: Optional embedding model instance
+        skip_analysis: If True, skip LLM analysis and only vectorize the report
+        max_reports: Maximum number of reports to process (None for all)
+    """
+    # Determine site type if auto
+    if site_type == "auto":
+        if "cantina.xyz" in url:
+            site_type = "cantina"
+        else:
+            site_type = "generic"
+            
+    console.print(f"[bold blue]Scraping portfolio reports from {url} (site type: {site_type})[/bold blue]")
+    
+    try:
+        # Get the portfolio page content
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        # Extract all report URLs
+        report_urls = []
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for links that match the portfolio item pattern based on site type
+        if site_type == "cantina":
+            # Cantina-specific pattern
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if '/portfolio/' in href and not href.endswith('/portfolio/'):
+                    if not href.startswith('http'):
+                        href = 'https://cantina.xyz' + href
+                    report_urls.append(href)
+        else:
+            # Generic approach - look for links that might be report URLs
+            # This is a heuristic approach that looks for links that might contain reports
+            base_url = url.split('//')[0] + '//' + url.split('//')[1].split('/')[0]
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                # Look for links that might be reports (contain keywords or have UUID-like patterns)
+                if any(term in href.lower() for term in ['report', 'audit', 'finding', 'vulnerability', 'security']):
+                    if not href.startswith('http'):
+                        if href.startswith('/'):
+                            href = base_url + href
+                        else:
+                            href = base_url + '/' + href
+                    report_urls.append(href)
+        
+        # Remove duplicates while preserving order
+        report_urls = list(dict.fromkeys(report_urls))
+        
+        if max_reports:
+            report_urls = report_urls[:max_reports]
+            
+        console.print(f"[green]Found {len(report_urls)} Cantina reports to process[/green]")
+        
+        # Process each report
+        processed_count = 0
+        for report_url in report_urls:
+            try:
+                # Extract report ID from URL
+                report_id = report_url.split('/')[-1]
+                
+                # Check if report already exists in database
+                if report_already_exists(report_id):
+                    console.print(f"[yellow]Report {report_id} already exists in database, skipping...[/yellow]")
+                    continue
+                
+                console.print(f"[bold cyan]Processing report: {report_url}[/bold cyan]")
+                
+                # Get the report page content
+                report_response = requests.get(report_url)
+                report_response.raise_for_status()
+                
+                # Extract the report content based on site type
+                if site_type == "cantina":
+                    report_content = extract_cantina_report_content(report_response.text, report_url)
+                else:
+                    report_content = extract_generic_report_content(report_response.text, report_url)
+                
+                if not report_content:
+                    console.print(f"[yellow]No findings extracted from {report_url}, skipping...[/yellow]")
+                    continue
+                
+                # Process the report content as markdown
+                report_md = format_report_content_as_markdown(report_content)
+                
+                # Generate a unique report ID based on URL if not already available
+                if not report_id:
+                    report_id = hashlib.md5(report_url.encode()).hexdigest()
+                
+                # Split the report into sections
+                sections = split_into_sections(report_md)
+                
+                # Compute embeddings
+                overall_embedding = compute_embedding(report_md, model_instance)
+                section_embeddings = {}
+                for section_title, section_content in sections.items():
+                    section_embeddings[section_title] = compute_embedding(section_content, model_instance)
+                
+                # Generate metadata
+                metadata = {
+                    "source": site_type,
+                    "url": report_url,
+                    "date_processed": datetime.now().isoformat(),
+                    "sections": list(sections.keys())
+                }
+                
+                # Perform LLM analysis if not skipped
+                analysis_summary = {}
+                pattern = "N/A"
+                if not skip_analysis:
+                    try:
+                        analysis_summary = generate_structured_analysis(report_md, model="deepseek-r1:32b")
+                        pattern = analysis_summary.get("pattern", "N/A")
+                    except Exception as e:
+                        console.print(f"[red]Error during LLM analysis: {e}[/red]")
+                        analysis_summary = {"error": str(e)}
+                
+                # Save the report to the database
+                save_report(report_id, report_url, report_md, overall_embedding, section_embeddings, analysis_summary, metadata)
+                
+                # Save the pattern if analysis was performed
+                if not skip_analysis and pattern != "N/A":
+                    save_pattern(report_id, pattern)
+                
+                processed_count += 1
+                console.print(f"[green]Successfully processed report: {report_url}[/green]")
+                
+            except Exception as e:
+                console.print(f"[red]Error processing report {report_url}: {e}[/red]")
+        
+        console.print(f"[bold green]Completed processing {processed_count} reports from {site_type} site[/bold green]")
+        return processed_count
+        
+    except Exception as e:
+        console.print(f"[red]Error scraping portfolio from {url}: {e}[/red]")
+        return 0
+
+def extract_cantina_report_content(html_content, report_url):
+    """
+    Extract the findings content from a Cantina report page.
+    
+    Args:
+        html_content: HTML content of the report page
+        report_url: URL of the report page for pagination handling
+    
+    Returns:
+        Dictionary containing the extracted findings content
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Extract report title
+        title_element = soup.find('h1')
+        title = title_element.text.strip() if title_element else "Unknown Report"
+        
+        # Extract project name and date if available
+        project_name = ""
+        date_range = ""
+        metadata_div = soup.find('div', class_=lambda c: c and 'metadata' in c)
+        if metadata_div:
+            project_element = metadata_div.find('p', class_=lambda c: c and 'project' in c)
+            if project_element:
+                project_name = project_element.text.strip()
+            
+            date_element = metadata_div.find('p', class_=lambda c: c and 'date' in c)
+            if date_element:
+                date_range = date_element.text.strip()
+        
+        # Extract findings
+        findings = []
+        
+        # Look for findings sections which are typically under h3 headings like "Medium Risk", "High Risk", etc.
+        risk_headings = soup.find_all(['h3', 'h2'], string=lambda s: s and any(risk in s.lower() for risk in ['risk', 'severity', 'finding', 'vulnerability']))
+        
+        for heading in risk_headings:
+            risk_level = heading.text.strip()
+            
+            # Find all finding elements after this heading until the next heading
+            finding_elements = []
+            current = heading.next_sibling
+            
+            while current and current.name not in ['h2', 'h3']:
+                if current.name:
+                    finding_elements.append(current)
+                current = current.next_sibling
+            
+            # Process each finding
+            for element in finding_elements:
+                if element.name in ['div', 'section'] and element.text.strip():
+                    # Extract finding details
+                    finding_title = ""
+                    title_el = element.find(['h4', 'h5', 'strong', 'b'])
+                    if title_el:
+                        finding_title = title_el.text.strip()
+                    
+                    # Extract the full content
+                    content = element.text.strip()
+                    
+                    # Only add if we have actual content
+                    if content and len(content) > 50:  # Minimum content length check
+                        findings.append({
+                            "risk_level": risk_level,
+                            "title": finding_title,
+                            "content": content
+                        })
+        
+        # If no findings were found using the structured approach, try a more general extraction
+        if not findings:
+            # Look for content divs that might contain findings
+            content_divs = soup.find_all('div', class_=lambda c: c and any(term in c.lower() for term in ['content', 'finding', 'vulnerability', 'report']))
+            
+            for div in content_divs:
+                content = div.text.strip()
+                if content and len(content) > 100:  # Minimum content length check
+                    findings.append({
+                        "risk_level": "Unknown",
+                        "title": "",
+                        "content": content
+                    })
+        
+        # Compile the report data
+        report_data = {
+            "title": title,
+            "project": project_name,
+            "date": date_range,
+            "url": report_url,
+            "findings": findings
+        }
+        
+        return report_data
+        
+    except Exception as e:
+        console.print(f"[red]Error extracting content from Cantina report: {e}[/red]")
+        return None
+
+def extract_generic_report_content(html_content, report_url):
+    """
+    Extract the findings content from a generic report page.
+    This is a more general approach that tries to identify common patterns in security reports.
+    
+    Args:
+        html_content: HTML content of the report page
+        report_url: URL of the report page
+    
+    Returns:
+        Dictionary containing the extracted findings content
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Extract report title - look for the most prominent heading
+        title_element = soup.find(['h1', 'h2', 'title'])
+        title = title_element.text.strip() if title_element else "Unknown Report"
+        
+        # Extract project name and date if available - look for metadata sections
+        project_name = ""
+        date_range = ""
+        
+        # Look for project name in common patterns
+        project_elements = soup.find_all(['h2', 'h3', 'div', 'span', 'p'], 
+                                       string=lambda s: s and any(term in s.lower() for term in ['project', 'client', 'protocol', 'contract']))
+        if project_elements:
+            for element in project_elements:
+                text = element.text.strip()
+                if len(text) < 100:  # Avoid capturing large blocks of text
+                    project_name = text
+                    break
+        
+        # Look for date in common patterns
+        date_elements = soup.find_all(['div', 'span', 'p', 'time'], 
+                                    string=lambda s: s and any(term in s.lower() for term in ['date', 'period', 'time', 'duration']))
+        if date_elements:
+            for element in date_elements:
+                text = element.text.strip()
+                if len(text) < 100:  # Avoid capturing large blocks of text
+                    date_range = text
+                    break
+        
+        # Extract findings - look for common security report sections
+        findings = []
+        
+        # Look for findings sections with common headings
+        finding_headings = soup.find_all(['h2', 'h3', 'h4'], 
+                                       string=lambda s: s and any(term in s.lower() for term in 
+                                                               ['finding', 'issue', 'vulnerability', 'bug', 'risk', 
+                                                                'critical', 'high', 'medium', 'low', 'informational', 
+                                                                'severity', 'impact', 'exploit']))
+        
+        for heading in finding_headings:
+            risk_level = "Unknown"
+            
+            # Try to determine risk level from the heading
+            heading_text = heading.text.lower()
+            if 'critical' in heading_text:
+                risk_level = "Critical"
+            elif 'high' in heading_text:
+                risk_level = "High"
+            elif 'medium' in heading_text:
+                risk_level = "Medium"
+            elif 'low' in heading_text:
+                risk_level = "Low"
+            elif 'informational' in heading_text or 'info' in heading_text:
+                risk_level = "Informational"
+            
+            # Extract the finding content - get all content until the next heading of same or higher level
+            finding_content = []
+            current = heading.next_sibling
+            
+            while current:
+                if current.name and current.name in ['h2', 'h3', 'h4'] and current.name <= heading.name:
+                    break
+                if current.name:
+                    finding_content.append(current.text.strip())
+                current = current.next_sibling
+            
+            # Join the content and add to findings
+            content = "\n".join([c for c in finding_content if c])
+            if content and len(content) > 50:  # Minimum content length check
+                findings.append({
+                    "risk_level": risk_level,
+                    "title": heading.text.strip(),
+                    "content": content
+                })
+        
+        # If no findings were found using the structured approach, try a more general extraction
+        if not findings:
+            # Look for content divs that might contain findings
+            content_divs = soup.find_all(['div', 'section', 'article'], 
+                                        class_=lambda c: c and any(term in (c.lower() if c else "") 
+                                                                for term in ['content', 'finding', 'vulnerability', 'report', 'issue']))
+            
+            for div in content_divs:
+                content = div.text.strip()
+                if content and len(content) > 100:  # Minimum content length check
+                    findings.append({
+                        "risk_level": "Unknown",
+                        "title": "",
+                        "content": content
+                    })
+        
+        # Compile the report data
+        report_data = {
+            "title": title,
+            "project": project_name,
+            "date": date_range,
+            "url": report_url,
+            "findings": findings
+        }
+        
+        return report_data
+        
+    except Exception as e:
+        console.print(f"[red]Error extracting content from generic report: {e}[/red]")
+        return None
+
+def format_report_content_as_markdown(report_data):
+    """
+    Format the extracted Cantina report content as Markdown.
+    
+    Args:
+        report_data: Dictionary containing the extracted report data
+    
+    Returns:
+        Markdown formatted string of the report content
+    """
+    if not report_data or not report_data.get("findings"):
+        return ""
+    
+    md_lines = []
+    
+    # Add report title and metadata
+    md_lines.append(f"# {report_data['title']}\n")
+    
+    if report_data.get("project"):
+        md_lines.append(f"**Project:** {report_data['project']}\n")
+    
+    if report_data.get("date"):
+        md_lines.append(f"**Date:** {report_data['date']}\n")
+    
+    md_lines.append(f"**Source:** {report_data['url']}\n")
+    
+    # Group findings by risk level
+    findings_by_risk = {}
+    for finding in report_data["findings"]:
+        risk_level = finding.get("risk_level", "Unknown")
+        if risk_level not in findings_by_risk:
+            findings_by_risk[risk_level] = []
+        findings_by_risk[risk_level].append(finding)
+    
+    # Add findings organized by risk level
+    md_lines.append("## Findings Summary\n")
+    
+    for risk_level, findings in findings_by_risk.items():
+        md_lines.append(f"### {risk_level}\n")
+        md_lines.append(f"*Number of findings: {len(findings)}*\n")
+    
+    # Add detailed findings
+    md_lines.append("## Detailed Findings\n")
+    
+    for risk_level, findings in findings_by_risk.items():
+        md_lines.append(f"### {risk_level}\n")
+        
+        for i, finding in enumerate(findings, 1):
+            # Add finding title if available
+            if finding.get("title"):
+                md_lines.append(f"#### {i}. {finding['title']}\n")
+            else:
+                md_lines.append(f"#### Finding {i}\n")
+            
+            # Add finding content
+            md_lines.append(f"{finding['content']}\n\n")
+    
+    return "\n".join(md_lines)
+
 # ---------------------- Vectorisation Functions ----------------------
-def process_markdown_file(file_url: str, source: str, model_instance=None):
-    """Download, embed, extract structured data via LLM, and save the report."""
+def process_markdown_file(file_url: str, source: str, model_instance=None, skip_analysis=False):
+    """Download, embed, extract structured data via LLM, and save the report.
+    
+    Args:
+        file_url: URL of the markdown file to process
+        source: Source identifier for the report
+        model_instance: Optional embedding model instance
+        skip_analysis: If True, skip LLM analysis and only vectorize the report
+    """
     console.print(f"[bold blue]🔄 Starting vectorization for: {file_url}[/bold blue]")
     report_id = hashlib.sha256(file_url.encode("utf-8")).hexdigest()
     console.print(f"[bold yellow]🛠 Calculated Report ID: {report_id}[/bold yellow]")
@@ -764,25 +1329,43 @@ def process_markdown_file(file_url: str, source: str, model_instance=None):
         {"title": sec["title"], "content": sec["content"], "embedding": compute_embedding(sec["content"], model_instance)}
         for sec in sections if sec["content"]
     ]
-    console.print("[bold yellow]🔍 Generating structured analysis via LLM...[/bold yellow]")
-    analysis_summary = generate_structured_analysis(content, model="deepseek-r1:32b")
+    
+    # Initialize analysis_summary as empty if skipping analysis
+    analysis_summary = {}
+    pattern = "N/A"
+    
+    if not skip_analysis:
+        console.print("[bold yellow]🔍 Generating structured analysis via LLM...[/bold yellow]")
+        analysis_summary = generate_structured_analysis(content, model="deepseek-r1:32b")
+        pattern = analysis_summary.get("pattern", "N/A")
+    else:
+        console.print("[bold yellow]🔍 Skipping LLM analysis as requested...[/bold yellow]")
+    
     metadata = {
         "downloaded_at": datetime.utcnow().isoformat() + "Z",
         "report_length": len(content),
         "word_count": len(content.split()),
         "embedding_model": "all-MiniLM-L6-v2",
-        "llm_model": "deepseek-r1:32b",
+        "llm_model": "deepseek-r1:32b" if not skip_analysis else "skipped",
         "script_version": "3.2"
     }
     console.print("[bold cyan]💾 Saving data to the database...[/bold cyan]")
     save_report(report_id, source, content, overall_embedding, section_embeddings, analysis_summary, metadata)
+    
     # Save the basic pattern extracted (if any)
-    pattern = analysis_summary.get("pattern", "N/A")
-    save_pattern(report_id, pattern)
-    console.print("[bold green]✅ Report successfully vectorized and saved to database![/bold green]")
+    if not skip_analysis:
+        save_pattern(report_id, pattern)
+    
+    console.print("[bold green]✅ Report successfully vectorized" + (" and analyzed" if not skip_analysis else "") + " and saved to database![/bold green]")
 
-def process_single_file(url: str, model_instance=None):
-    """Process a single Markdown file or all .md files in a GitHub directory."""
+def process_single_file(url: str, model_instance=None, skip_analysis=False):
+    """Process a single Markdown file or all .md files in a GitHub directory.
+    
+    Args:
+        url: URL of the file or directory to process
+        model_instance: Optional embedding model instance
+        skip_analysis: If True, skip LLM analysis and only vectorize the report
+    """
     # Handle GitHub directory URLs (tree, blob, or trailing /md/)
     if (
         "github.com" in url and (
@@ -798,36 +1381,6 @@ def process_single_file(url: str, model_instance=None):
                 owner = parts[0]
                 repo = parts[1]
                 branch = parts[idx+1]
-                dir_path = "/".join(parts[idx+2:])
-            elif "blob" in parts:
-                idx = parts.index("blob")
-                owner = parts[0]
-                repo = parts[1]
-                branch = parts[idx+1]
-                dir_path = "/".join(parts[idx+2:])
-            else:
-                # fallback for .../md or /md/
-                owner = parts[0]
-                repo = parts[1]
-                branch = parts[3] if len(parts) > 3 else "master"
-                dir_path = "/".join(parts[4:]) if len(parts) > 4 else ""
-            console.print(f"[cyan]{debug_info}\n[debug] owner={owner}, repo={repo}, branch={branch}, dir_path={dir_path}[/cyan]")
-            # Remove trailing slashes from dir_path for GitHub API compatibility
-            dir_path = dir_path.rstrip("/")
-            api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
-            console.print(f"[bold yellow]Fetching GitHub API URL: {api_url}[/bold yellow]")
-            headers = {"User-Agent": "DeepCurrent-VectorEyes/1.0"}
-            resp = requests.get(api_url, headers=headers)
-            if resp.status_code == 200:
-                files = resp.json()
-                md_files = [f for f in files if f['name'].endswith('.md') and 'readme' not in f['name'].lower()]
-                if not md_files:
-                    console.print(f"[yellow]No Markdown files found in directory: {url}[/yellow]")
-                    return
-                for f in md_files:
-                    raw_url = f['download_url']
-                    process_markdown_file(raw_url, raw_url, model_instance)
-                return
             else:
                 console.print(f"[red]Failed to fetch directory listing from GitHub API (HTTP {resp.status_code})[/red]")
                 console.print(f"[red]GitHub API response: {resp.text}[/red]")
@@ -841,89 +1394,132 @@ def process_single_file(url: str, model_instance=None):
         with task_lock:
             task_status[report_id] = "Skipped (ignored file)"
         return
-    process_markdown_file(url, url, model_instance)
+    process_markdown_file(url, url, model_instance, skip_analysis=skip_analysis)
 
-def process_repo(url: str, model_instance=None):
-    """Process all Markdown files in a GitHub repository."""
+def process_repo(url: str, model_instance=None, skip_analysis=False):
+    """Process all Markdown files in a GitHub repository.
+    
+    Args:
+        url: URL of the repository to process
+        model_instance: Optional embedding model instance
+        skip_analysis: If True, skip LLM analysis and only vectorize the report
+    """
     if "github.com" not in url:
         with task_lock:
             task_status[url] = "Error: Not a GitHub URL"
         return
     
-    # Determine branch name from URL (default to master if not found)
-    branch = "master"  # Default to master instead of main
-    if "/tree/" in url:
-        branch = url.split("/tree/")[1].split("/")[0]
-    elif "/blob/" in url:
-        branch = url.split("/blob/")[1].split("/")[0]
+    console.print(f"[bold cyan]Processing GitHub repository: {url}[/bold cyan]")
     
-    # Check if URL points to a specific directory
-    is_directory = False
-    dir_path = ""
-    if "/tree/" in url or "/blob/" in url:
-        is_directory = True
-        parts = url.split("/")
-        if "tree" in parts:
-            idx = parts.index("tree")
-            dir_path = "/".join(parts[idx+2:])
-        elif "blob" in parts:
-            idx = parts.index("blob")
-            dir_path = "/".join(parts[idx+2:])
-    
-    # Extract owner and repo
-    parts = url.strip("/").split("/")
-    if len(parts) < 5:
-        with task_lock:
-            task_status[url] = "Error: Invalid repo URL"
+    # Parse GitHub URL to extract owner, repo, branch, and path
+    try:
+        # Remove any trailing slashes
+        url = url.rstrip('/')
+        
+        # Extract the part after github.com/
+        github_path = url.split('github.com/')[-1]
+        
+        # Split the path into components
+        parts = github_path.split('/')
+        
+        # First two parts are always owner and repo
+        if len(parts) < 2:
+            console.print(f"[red]Invalid GitHub URL format: {url}[/red]")
+            return
+            
+        owner = parts[0]
+        repo = parts[1]
+        
+        # Default branch and path
+        branch = "main"  # Default to main
+        dir_path = ""
+        
+        # Check if URL contains tree or blob to determine branch and path
+        if len(parts) > 3 and parts[2] in ["tree", "blob"]:
+            branch = parts[3]
+            dir_path = "/".join(parts[4:]) if len(parts) > 4 else ""
+        
+        console.print(f"[dim]Parsed GitHub URL - Owner: {owner}, Repo: {repo}, Branch: {branch}, Path: {dir_path}[/dim]")
+    except Exception as e:
+        console.print(f"[red]Error parsing GitHub URL: {e}[/red]")
         return
-    owner, repo = parts[3], parts[4]
     
-    # Add User-Agent header to prevent GitHub API rejections
+    # Set up headers for GitHub API
     headers = {"User-Agent": "DeepCurrent-VectorEyes/1.0"}
     
     # If URL points to a specific directory, use contents API
-    if is_directory:
-        dir_path = dir_path.rstrip("/")
+    if dir_path:
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
         console.print(f"[bold yellow]Fetching GitHub API URL: {api_url}[/bold yellow]")
-        r = requests.get(api_url, headers=headers)
-        if r.status_code != 200:
-            with task_lock:
-                task_status[url] = f"Error: Repo fetch failed (HTTP {r.status_code})"
-                console.print(f"[red]GitHub API response: {r.text}[/red]")
-            return
         
-        # Process files in the directory
-        files = r.json()
-        md_files = [f for f in files if f['name'].endswith('.md') and 'readme' not in f['name'].lower()]
-        if not md_files:
-            with task_lock:
-                task_status[url] = "No Markdown files found"
+        try:
+            resp = requests.get(api_url, headers=headers)
+            
+            if resp.status_code == 404 and branch == "main":
+                # Try with master branch if main fails
+                branch = "master"
+                api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
+                console.print(f"[yellow]Main branch not found, trying master branch: {api_url}[/yellow]")
+                resp = requests.get(api_url, headers=headers)
+            
+            if resp.status_code == 200:
+                files = resp.json()
+                
+                # Handle both single file and directory responses
+                if isinstance(files, dict):  # Single file
+                    files = [files]
+                
+                md_files = [f for f in files if f['name'].endswith('.md') and 'readme' not in f['name'].lower()]
+                
+                if not md_files:
+                    console.print(f"[yellow]No Markdown files found in directory: {url}[/yellow]")
+                    return
+                
+                console.print(f"[green]Found {len(md_files)} Markdown files to process[/green]")
+                for f in md_files:
+                    raw_url = f['download_url']
+                    console.print(f"[dim]Processing: {f['name']}[/dim]")
+                    process_markdown_file(raw_url, raw_url, model_instance, skip_analysis=skip_analysis)
+                return
+            else:
+                console.print(f"[red]Failed to fetch directory listing from GitHub API (HTTP {resp.status_code})[/red]")
+                console.print(f"[red]GitHub API response: {resp.text}[/red]")
+                return
+        except Exception as e:
+            console.print(f"[red]Error accessing GitHub API: {e}[/red]")
             return
-        for f in md_files:
-            raw_url = f['download_url']
-            process_markdown_file(raw_url, raw_url, model_instance)
-        return
     
     # Otherwise, get all files in the repo
     repo_api = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     console.print(f"[bold yellow]Fetching GitHub API URL: {repo_api}[/bold yellow]")
-    r = requests.get(repo_api, headers=headers)
-    if r.status_code != 200:
-        with task_lock:
-            task_status[url] = f"Error: Repo fetch failed (HTTP {r.status_code})"
-            console.print(f"[red]GitHub API response: {r.text}[/red]")
-        return
     
-    tree = r.json().get("tree", [])
-    md_files = [item["path"] for item in tree if item["path"].endswith(".md") and "readme" not in item["path"].lower()]
-    if not md_files:
+    try:
+        r = requests.get(repo_api, headers=headers)
+        if r.status_code != 200:
+            with task_lock:
+                task_status[url] = f"Error: Repo fetch failed (HTTP {r.status_code})"
+            console.print(f"[red]GitHub API response: {r.text}[/red]")
+            return
+        
+        # Process all Markdown files in the repo
+        tree = r.json().get('tree', [])
+        md_files = [f for f in tree if f['path'].endswith('.md') and 'readme' not in f['path'].lower()]
+        
+        if not md_files:
+            with task_lock:
+                task_status[url] = "No Markdown files found"
+            return
+        
+        console.print(f"[green]Found {len(md_files)} Markdown files to process in repository[/green]")
+        for f in md_files:
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{f['path']}"
+            console.print(f"[dim]Processing: {f['path']}[/dim]")
+            process_markdown_file(raw_url, raw_url, model_instance, skip_analysis=skip_analysis)
+    except Exception as e:
+        console.print(f"[red]Error processing repository: {e}[/red]")
         with task_lock:
-            task_status[url] = "No Markdown files found"
+            task_status[url] = f"Error: {str(e)}"
         return
-    for path in md_files:
-        file_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-        process_markdown_file(file_url, url + "/" + path, model_instance)
 
 # ---------------------- Detection Library Functions ----------------------
 def init_detection_library_table():
