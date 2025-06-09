@@ -57,6 +57,15 @@ uv run sAils.py --recategorize-other-vulns
 > ✅ Merges duplicate entries and handles conflicts automatically
 > ✅ Provides detailed statistics on recategorization results
 
+### 🔹 Analyze Specific Reports by ID
+```bash
+uv run sAils.py --analyze-specific-reports report_id1 report_id2 --llm-provider openrouter --openrouter-key YOUR_API_KEY
+```
+> ✅ Analyzes only the specified reports by their IDs
+> ✅ Works with both local Ollama models and OpenRouter cloud models
+> ✅ Saves analysis summaries directly to the database
+> ✅ Useful for targeting specific reports that need reanalysis
+
 ### 🔹 Fix Unknown Reports
 ```bash
 uv run sAils.py --fix-unknown-reports
@@ -94,6 +103,17 @@ Set via CLI:
 # or
 --llm-provider openrouter --openrouter-key sk-... --openrouter-model google/gemini-2.5-pro
 ```
+
+### Advanced JSON Extraction
+
+Both LLM providers now feature robust JSON extraction capabilities:
+
+- Multiple extraction strategies for handling various response formats
+- Code block extraction for JSON wrapped in markdown code blocks
+- Brace matching to find complete JSON objects
+- Incremental substring parsing for partially valid JSON
+- Fallback to structured markdown extraction when JSON parsing fails
+- Automatic field validation and default value handling
 
 ---
 
@@ -133,6 +153,8 @@ sAils/sessions/
 | `--session` | Output folder name |
 | `--vuln-scan` | Run vulnerability detection scan |
 | `--watch` | Watch mode for folder monitoring |
+| `--analyze-reports` | Analyze ingested reports with LLM (separate from ingestion) |
+| `--analyze-specific-reports` | Analyze specific reports by their IDs with LLM |
 
 ### LLM Provider Options
 | Flag | Description |
