@@ -426,15 +426,36 @@ class NewDirectoryHandler(FileSystemEventHandler):
         if not os.path.isdir(path):
             return
 
-        session_name = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # Print debug info about contract files
         print(f"\n📁 Directory {trigger}: {path}")
-        print(f"🚀 Triggering analysis in session: {session_name}")
+        print("Searching for contract files...")
+        contract_files = []
+        for root, _, files in os.walk(path):
+            for f in files:
+                if f.endswith(('.sol', '.vy', '.rs', '.ts', '.move')):
+                    full_path = os.path.join(root, f)
+                    contract_files.append(full_path)
+                    print(f"Found contract: {full_path}")
+        
+        if not contract_files:
+            print(f"No contract files found in {path} or its subdirectories")
+            return
+        
+        print(f"Found {len(contract_files)} contract files")
+        
+        session_name = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # Create the full session path in the centralized sessions directory
+        session_folder = os.path.join(SESSIONS_DIR, session_name)
+        # Ensure the directory exists
+        os.makedirs(session_folder, exist_ok=True)
+        
+        print(f"🚀 Triggering analysis in session: {session_folder}")
 
         vuln_pipeline(
             report_urls=[],
             contract_dir=path,
             doc_paths=[],
-            session_folder=session_name,
+            session_folder=session_folder,
             run_vuln_scan=True
         )
 
