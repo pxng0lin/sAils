@@ -251,7 +251,7 @@ def is_contract_already_analyzed(file_path):
         return False
 
 @task
-def scan_contracts(contract_dir: str, session_folder: str):
+def scan_contracts(contract_dir: str, session_folder: str, skip_analysis: bool = False):
     contract_files = []
     for root, _, files in os.walk(contract_dir):
         for f in files:
@@ -267,7 +267,22 @@ def scan_contracts(contract_dir: str, session_folder: str):
         return 0
 
     os.makedirs(session_folder, exist_ok=True)
-    asyncio.run(process_contracts_parallel(contract_files, session_folder))
+    
+    if not skip_analysis:
+        # Only run the analysis if skip_analysis is False
+        asyncio.run(process_contracts_parallel(contract_files, session_folder))
+    else:
+        # If skipping analysis, just copy the contract files to the session folder
+        print("[INFO] Skipping analysis, preparing files for vulnerability scan only...")
+        for file_path in contract_files:
+            file_name = os.path.basename(file_path)
+            contract_dir = os.path.join(session_folder, file_name)
+            os.makedirs(contract_dir, exist_ok=True)
+            with open(file_path, 'r', encoding='utf-8') as src_file:
+                content = src_file.read()
+            with open(os.path.join(contract_dir, 'original.sol'), 'w', encoding='utf-8') as dest_file:
+                dest_file.write(content)
+    
     return len(contract_files)
 
 @task
@@ -1333,14 +1348,16 @@ def main():
             print("[ERROR] For --vuln-scan-only without an existing session, you must specify --contracts.")
             return
             
-        # Let's process the contracts first
-        analyzed = scan_contracts(args.contracts, session)
+        # Let's process the contracts first, but skip the analysis step
+        analyzed = scan_contracts(args.contracts, session, skip_analysis=True)
         if analyzed <= 0:
-            print("[ERROR] No contracts were analyzed. Vulnerability scan cannot proceed.")
+            print("[ERROR] No contracts were found. Vulnerability scan cannot proceed.")
             return
             
         # Check if detection_library already exists and is populated
         try:
+            # Import sqlite3 here to ensure it's available
+            import sqlite3
             conn = sqlite3.connect(VECTOR_DB_PATH)
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM detection_library")

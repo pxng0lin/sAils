@@ -9,6 +9,7 @@ and recategorizes them using LLM analysis to make them valid for the detection l
 import os
 import json
 import sqlite3
+import re  # Added missing import for regular expressions
 from datetime import datetime
 from rich.console import Console
 from rich.progress import Progress

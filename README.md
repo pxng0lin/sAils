@@ -1,4 +1,4 @@
-# 📄 README.md — Multiple enhancements
+# 📄 README.md
 
 <p align="center">
   <img src="sAils_logo_small.png" alt="sAils Logo" width="200"/>
@@ -30,6 +30,18 @@ All components are **single-file scripts** compatible with **[Astral](https://as
 ```bash
 uv run sAils.py --contracts ./contracts --vuln-scan
 ```
+> ✅ Performs full contract analysis followed by vulnerability scanning
+> ✅ Creates a timestamped session folder with all analysis artifacts
+> ✅ Generates detailed reports and diagrams for each contract
+
+### 🔹 Vulnerability Scan Only
+```bash
+uv run sAils.py --contracts ./contracts --vuln-scan-only
+```
+> ✅ Skips the time-consuming analysis step
+> ✅ Directly performs vulnerability scanning on the contracts
+> ✅ Significantly faster than full analysis + scan
+> ✅ Useful when you only need vulnerability detection
 
 ### 🔹 Add Documents and Reports
 ```bash
@@ -39,6 +51,9 @@ uv run sAils.py \
   --reports https://raw.githubusercontent.com/.../audit.md \
   --vuln-scan
 ```
+> ✅ Analyzes contracts, documentation, and ingests vulnerability reports
+> ✅ Creates connections between all sources for comprehensive understanding
+> ✅ Enhances vulnerability detection with knowledge from reports
 
 ### 🔹 Watch Mode: Auto-Trigger on New Folders
 ```bash
@@ -74,6 +89,46 @@ uv run sAils.py --fix-unknown-reports
 > ✅ Uses LLM to analyze report content and determine appropriate categories
 > ✅ Creates automatic database backups before making changes
 > ✅ Works with the same reports identified by --clean-reports
+
+---
+
+## 🔍 Vulnerability Scanning Options
+
+sAils offers two approaches to vulnerability scanning:
+
+### Full Analysis + Vulnerability Scan (`--vuln-scan`)
+
+The standard approach performs a complete analysis of the contracts before running vulnerability detection:
+
+```bash
+uv run sAils.py --contracts ./contracts --vuln-scan
+```
+
+- ✅ Performs deep semantic analysis of contract code
+- ✅ Generates comprehensive reports, diagrams, and insights
+- ✅ Identifies complex vulnerability patterns
+- ✅ Takes longer to complete but provides more context
+
+### Vulnerability Scan Only (`--vuln-scan-only`)
+
+The optimized approach skips the analysis step and directly performs vulnerability scanning:
+
+```bash
+uv run sAils.py --contracts ./contracts --vuln-scan-only
+```
+
+- ✅ Significantly faster than full analysis + scan
+- ✅ Focuses exclusively on vulnerability detection
+- ✅ Uses the same detection library and patterns
+- ✅ Ideal for quick security checks or when you've already analyzed the contracts
+- ✅ Perfect for CI/CD pipelines where speed is important
+
+#### When to use `--vuln-scan-only`:
+
+- When you need quick vulnerability detection without full analysis
+- For regular security checks during development
+- When you've already analyzed the contracts and only want to check for vulnerabilities
+- In automated testing pipelines where speed is critical
 
 ---
 
@@ -145,47 +200,62 @@ sAils/sessions/
 ## 🔧 Options
 
 ### Core Options
-| Flag | Description |
-|------|-------------|
-| `--contracts` | Path to contract dir or file |
-| `--docs` | PDFs, markdowns, or URLs |
-| `--reports` | GitHub/Markdown audit reports |
-| `--session` | Output folder name |
-| `--vuln-scan` | Run vulnerability detection scan |
-| `--watch` | Watch mode for folder monitoring |
-| `--analyze-reports` | Analyze ingested reports with LLM (separate from ingestion) |
-| `--analyze-specific-reports` | Analyze specific reports by their IDs with LLM |
+| Flag | Description | Example |
+|------|-------------|--------|
+| `--contracts` | Path to contract directory or file | `--contracts ./contracts` |
+| `--docs` | PDFs, markdowns, or URLs to analyze | `--docs ./docs/spec.pdf ./whitepaper.md` |
+| `--reports` | GitHub/Markdown audit reports to ingest | `--reports https://github.com/user/repo/audit.md` |
+| `--session` | Custom output folder name | `--session my_analysis_session` |
+| `--vuln-scan` | Run vulnerability detection scan after analysis | `--vuln-scan` |
+| `--vuln-scan-only` | Skip analysis and run only vulnerability scan | `--vuln-scan-only --contracts ./contracts` |
+| `--watch` | Watch mode for folder monitoring | `--watch` |
+| `--qa-mode` | Run in Q&A mode for analyzed contracts | `--qa-mode --session my_session` |
+| `--analyze-reports` | Analyze ingested reports with LLM | `--analyze-reports` |
+| `--analyze-specific-reports` | Analyze specific reports by their IDs | `--analyze-specific-reports report_id1 report_id2` |
+| `--web-portfolio` | URL to a web portfolio for report ingestion | `--web-portfolio https://cantina.xyz/portfolio` |
+| `--site-type` | Type of site to scrape (auto, cantina, generic) | `--site-type cantina` |
 
 ### LLM Provider Options
-| Flag | Description |
-|------|-------------|
-| `--llm-provider` | `ollama` or `openrouter` |
-| `--ollama-model` | Ollama model name |
-| `--openrouter-key` | OpenRouter API key |
-| `--openrouter-model` | OpenRouter model to use |
-| `--analysis-model` | Specific model for analysis tasks |
-| `--query-model` | Specific model for query tasks |
-| `--test-llm-connection` | Test connection to LLM provider and show available models |
+| Flag | Description | Example |
+|------|-------------|--------|
+| `--llm-provider` | Choose LLM backend: 'ollama' or 'openrouter' | `--llm-provider ollama` |
+| `--ollama-model` | Local Ollama model name | `--ollama-model deepseek-r1:32b` |
+| `--openrouter-key` | OpenRouter API key for cloud LLM usage | `--openrouter-key sk-...` |
+| `--openrouter-model` | OpenRouter model to use | `--openrouter-model google/gemini-2.5-pro` |
+| `--analysis-model` | Specific model for analysis tasks | `--analysis-model deepseek-r1:32b` |
+| `--query-model` | Specific model for query tasks | `--query-model deepseek-r1:32b` |
+| `--test-llm-connection` | Test connection to LLM provider | `--test-llm-connection` |
 
 ### Vulnerability Library Management
-| Flag | Description |
-|------|-------------|
-| `--view-vuln-library` | View the vulnerability detection library |
-| `--vuln-detail` | Show detailed information for a specific vulnerability type |
-| `--export-vuln-library` | Export the vulnerability library to a markdown file |
-| `--build-vuln-library` | Rebuild the vulnerability detection library using LLM analysis |
-| `--recategorize-other-vulns` | Recategorize vulnerabilities labeled as 'Other' into specific types using LLM analysis |
-| `--fix-unknown-reports` | Fix reports with unknown vulnerability types and assign proper categories |
-| `--clean-reports` | Clean reports with unknown vulnerability types |
+| Flag | Description | Example |
+|------|-------------|--------|
+| `--view-vuln-library` | View the vulnerability detection library | `--view-vuln-library` |
+| `--vuln-detail` | Show detailed info for a vulnerability type | `--vuln-detail "Reentrancy"` |
+| `--export-vuln-library` | Export the vulnerability library to markdown | `--export-vuln-library vuln_lib.md` |
+| `--build-vuln-library` | Rebuild the vulnerability detection library | `--build-vuln-library` |
+| `--build-direct-templates` | Build templates directly from reports | `--build-direct-templates --min-examples 3` |
+| `--min-examples` | Minimum code examples for template building | `--min-examples 2` |
+| `--recategorize-other-vulns` | Recategorize 'Other' vulnerabilities | `--recategorize-other-vulns` |
+| `--fix-unknown-reports` | Fix reports with unknown vulnerability types | `--fix-unknown-reports` |
+| `--clean-reports` | Clean reports with unknown vulnerability types | `--clean-reports` |
+| `--diagnose-library` | Run diagnostic tests on the vulnerability library | `--diagnose-library` |
+| `--rebuild-with-llm` | Use LLM to rebuild the vulnerability library | `--rebuild-with-llm --api ollama` |
+| `--api` | API to use for the rebuild process | `--api openrouter` |
 
 ### LLM Enhancement Options
-| Flag | Description |
-|------|-------------|
-| `--enhance-library` | Enhance the vulnerability library with LLM-optimized features |
-| `--semantic-search` | Search vulnerabilities semantically using natural language |
-| `--llm-prompt` | Generate an LLM detection prompt for a specific vulnerability type |
-| `--llm-model` | Specify target LLM model for prompt generation (affects context size) |
-| `--openai-compatible` | Make generated prompts compatible with OpenAI API format |
+| Flag | Description | Example |
+|------|-------------|--------|
+| `--enhance-library` | Enhance library with LLM-optimized features | `--enhance-library` |
+| `--semantic-search` | Search vulnerabilities semantically | `--semantic-search "price manipulation"` |
+| `--llm-prompt` | Generate LLM detection prompt | `--llm-prompt "Reentrancy"` |
+| `--llm-model` | Target LLM model for prompt generation | `--llm-model gpt-4` |
+| `--openai-compatible` | Make prompts OpenAI API compatible | `--openai-compatible` |
+
+### Database Management
+| Flag | Description | Example |
+|------|-------------|--------|
+| `--merge-databases` | Merge databases from another sAils directory | `--merge-databases /path/to/other/sAils` |
+| `--no-llm-merge` | Disable LLM for similarity detection during merge | `--no-llm-merge` |
 
 ---
 
