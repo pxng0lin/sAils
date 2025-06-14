@@ -84,22 +84,44 @@ def call_ollama_api(prompt, model=OLLAMA_MODEL, max_attempts=3):
         "messages": [
             {"role": "system", "content": "You are a security expert analyzing smart contract vulnerabilities."},
             {"role": "user", "content": prompt}
-        ]
+        ],
+        "stream": False  # Ensure we get a complete response, not streaming
     }
     
     for attempt in range(1, max_attempts + 1):
         try:
             console.print(f"Attempt {attempt}/{max_attempts} using Ollama...")
-            response = requests.post(OLLAMA_API_URL, json=data, timeout=60)
+            response = requests.post(OLLAMA_API_URL, json=data, timeout=180)  # Increased timeout for large responses
             
             if response.status_code == 200:
-                response_data = response.json()
-                return response_data["message"]["content"]
+                try:
+                    # Log the raw response for debugging
+                    response_text = response.text
+                    response_data = response.json()
+                    
+                    # Handle different response formats from Ollama
+                    if "message" in response_data and "content" in response_data["message"]:
+                        return response_data["message"]["content"]
+                    elif "response" in response_data:
+                        return response_data["response"]
+                    else:
+                        console.print(f"Unexpected Ollama response format: {list(response_data.keys())}")
+                        return response_text  # Return raw text as fallback
+                except json.JSONDecodeError as e:
+                    console.print(f"JSON parsing error: {e}")
+                    # Try to extract content between the first { and last }
+                    json_start = response.text.find('{')
+                    json_end = response.text.rfind('}')
+                    if json_start >= 0 and json_end > json_start:
+                        return response.text[json_start:json_end+1]
+                    else:
+                        return response.text  # Return raw text as fallback
             else:
                 console.print(f"Ollama HTTP error: {response.status_code} - {response.text}")
             
-            # Wait before retrying
-            time.sleep(2)
+            # Wait before retrying with exponential backoff
+            wait_time = 2 ** attempt
+            time.sleep(wait_time)
             
         except Exception as e:
             console.print(f"Ollama request error: {e}")
@@ -184,17 +206,53 @@ def cluster_vulnerabilities(vuln_details_list, batch_size=40):
     
     # Parse the response
     try:
-        # Try to find a JSON block in the response
+        # First, try to parse the entire response as JSON
+        try:
+            library = json.loads(response)
+            console.print("[green]Successfully parsed complete JSON response[/green]")
+            return library
+        except json.JSONDecodeError:
+            # If that fails, try to extract JSON from the response
+            pass
+        
+        # Try to find a JSON block in the response (look for the outermost braces)
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
         
         if json_start >= 0 and json_end > json_start:
             json_str = response[json_start:json_end]
-            library = json.loads(json_str)
-            return library
-        else:
-            console.print("[red]No valid JSON found in LLM response[/red]")
-            return {}
+            
+            # Try to clean up common issues in the JSON string
+            # 1. Fix escaped quotes inside JSON strings
+            json_str = json_str.replace('\\"', '\"')
+            # 2. Fix unescaped newlines in JSON strings
+            json_str = json_str.replace('\n', '\\n')
+            
+            try:
+                library = json.loads(json_str)
+                console.print("[green]Successfully extracted and parsed JSON from response[/green]")
+                return library
+            except json.JSONDecodeError as e:
+                console.print(f"[yellow]JSON extraction failed: {e}[/yellow]")
+                console.print(f"Extracted JSON snippet: {json_str[:100]}...")
+                
+                # Try a more aggressive approach - use regex to find all JSON-like objects
+                import re
+                potential_jsons = re.findall(r'\{[^{}]*\}', response)
+                for i, potential_json in enumerate(potential_jsons):
+                    try:
+                        obj = json.loads(potential_json)
+                        if isinstance(obj, dict) and len(obj) > 0:
+                            console.print(f"[green]Found valid JSON object #{i+1}[/green]")
+                            return obj
+                    except:
+                        pass
+        
+        # If we get here, we couldn't find valid JSON
+        console.print("[red]No valid JSON found in LLM response[/red]")
+        # Log the response for debugging
+        console.print(f"Response: {response[:500]}...")
+        return {}
     
     except Exception as e:
         console.print(f"[red]Error parsing LLM response: {e}[/red]")

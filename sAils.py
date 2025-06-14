@@ -80,7 +80,11 @@ def ingest_reports(report_urls: List[str]):
     for url in report_urls:
         print(f"Processing report source: {url}")
         if "github.com" in url:
-            if "/tree/" in url or "/blob/" in url:
+            # Check if this is a GitHub repository root (no /tree/ or /blob/ but has format github.com/owner/repo)
+            github_path = url.split('github.com/')[-1].rstrip('/')
+            path_parts = github_path.split('/')
+            
+            if len(path_parts) == 2 or "/tree/" in url or "/blob/" in url:
                 # This is a GitHub repository or directory
                 print(f"Detected GitHub repository or directory: {url}")
                 process_repo(url, skip_analysis=True)
@@ -543,7 +547,7 @@ def main():
     vuln_lib_group.add_argument("--build-vuln-library", action="store_true", help="Rebuild the vulnerability detection library.")
     vuln_lib_group.add_argument("--build-direct-templates", action="store_true", help="Build templates directly from reports with less clustering.")
     vuln_lib_group.add_argument("--min-examples", type=int, default=2, help="Minimum code examples for direct template building (default: 2).")
-    vuln_lib_group.add_argument("--clean-reports", action="store_true", help="Clean reports with unknown vulnerability types.")
+    vuln_lib_group.add_argument("--clean-reports", action="store_true", help="Clean reports with unknown vulnerability types - offers options to fix with LLM or remove them.")
     vuln_lib_group.add_argument("--diagnose-library", action="store_true", help="Run diagnostic tests on the vulnerability library and fix issues.")
     vuln_lib_group.add_argument("--rebuild-with-llm", action="store_true", help="Use dedicated LLM-powered process to rebuild the vulnerability library.")
     vuln_lib_group.add_argument("--api", choices=["openrouter", "ollama"], help="API to use for the rebuild process.")
@@ -568,23 +572,36 @@ def main():
     
     args = parser.parse_args()
 
-    # ✅ Ensure session name is always set
-    session_name = args.session or f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Check if we're running a maintenance task that doesn't need a session
+    maintenance_tasks = [
+        args.clean_reports, args.view_vuln_library, args.export_vuln_library,
+        args.build_vuln_library, args.diagnose_library, args.recategorize_other_vulns,
+        args.fix_unknown_reports, args.test_llm_connection, args.merge_databases
+    ]
     
-    # Validate the session name
-    session_path = Path(session_name)
-    if session_path.is_absolute():
-        # If an absolute path was provided, extract just the name
-        session_name = session_path.name
-        print(f"[INFO] Using session name '{session_name}' from the provided path")
-    
-    # Check if the session name is a file (invalid)
-    if os.path.isfile(session_name):
-        print(f"[WARN] Session name '{session_name}' matches a file. Using fallback name instead.")
-        session_name = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Create the full session path in the centralized sessions directory
-    session = os.path.join(SESSIONS_DIR, session_name)
+    # Only create a session if we're not running a maintenance-only task
+    if not any(maintenance_tasks):
+        # ✅ Ensure session name is always set
+        session_name = args.session or f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Validate the session name
+        session_path = Path(session_name)
+        if session_path.is_absolute():
+            # If an absolute path was provided, extract just the name
+            session_name = session_path.name
+            print(f"[INFO] Using session name '{session_name}' from the provided path")
+        
+        # Check if the session name is a file (invalid)
+        if os.path.isfile(session_name):
+            print(f"[WARN] Session name '{session_name}' matches a file. Using fallback name instead.")
+            session_name = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Create the full session path in the centralized sessions directory
+        session = os.path.join(SESSIONS_DIR, session_name)
+    else:
+        # For maintenance tasks, set a dummy session name but don't create it
+        session_name = "maintenance"
+        session = None
     
     # Special handling for QA mode - session must exist
     if args.qa_mode:
@@ -603,9 +620,10 @@ def main():
         ask_questions_about_analysis(session)
         return
     
-    # For all non-QA modes, ensure the directory exists
-    print(f"[INFO] Using session directory: {session}")
-    os.makedirs(session, exist_ok=True)
+    # For all non-QA modes that need a session, ensure the directory exists
+    if session is not None:
+        print(f"[INFO] Using session directory: {session}")
+        os.makedirs(session, exist_ok=True)
     
     # Initialize databases for any mode
     initialize_databases()

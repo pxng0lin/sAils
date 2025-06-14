@@ -1469,7 +1469,8 @@ def process_repo(url: str, model_instance=None, skip_analysis=False):
                 if isinstance(files, dict):  # Single file
                     files = [files]
                 
-                md_files = [f for f in files if f['name'].endswith('.md') and 'readme' not in f['name'].lower()]
+                # Include all Markdown files, even if they have 'readme' in their name
+                md_files = [f for f in files if f['name'].endswith('.md')]
                 
                 if not md_files:
                     console.print(f"[yellow]No Markdown files found in directory: {url}[/yellow]")
@@ -1503,7 +1504,8 @@ def process_repo(url: str, model_instance=None, skip_analysis=False):
         
         # Process all Markdown files in the repo
         tree = r.json().get('tree', [])
-        md_files = [f for f in tree if f['path'].endswith('.md') and 'readme' not in f['path'].lower()]
+        # Include all Markdown files, even if they have 'readme' in their name
+        md_files = [f for f in tree if f['path'].endswith('.md')]
         
         if not md_files:
             with task_lock:
@@ -3042,12 +3044,12 @@ def render_layout() -> Panel:
     return outer
 
 def clean_unknown_reports():
-    """Remove reports with unknown vuln_type from the database"""
+    """Clean reports with unknown vuln_type from the database - either by removing or fixing them"""
     console.clear()
     console.print(Panel.fit(
         "[bold]Clean Unknown Reports[/bold]\n\n"
-        "This utility will identify and remove reports with 'Unknown' vulnerability types\n"
-        "and can help clean up the database for better detection library building.",
+        "This utility will identify reports with 'Unknown' vulnerability types\n"
+        "and offers options to either remove them or attempt to fix them using LLM analysis.",
         title="Database Cleanup Utility",
         border_style="blue"
     ))
@@ -3104,16 +3106,16 @@ def clean_unknown_reports():
         if confirm.lower() != "yes":
             return
     
-    # Offer to remove unknown reports
+    # Offer options for handling unknown reports
     if unknown_count > 0 or error_count > 0:
         total_problematic = unknown_count + error_count
-        confirm = Prompt.ask(
-            f"Remove all {total_problematic} reports with unknown vuln_type or parsing errors?", 
-            choices=["yes", "no"], 
-            default="no"
+        action = Prompt.ask(
+            f"What would you like to do with the {total_problematic} reports with unknown vuln_type or parsing errors?", 
+            choices=["fix", "remove", "cancel"], 
+            default="fix"
         )
         
-        if confirm.lower() == "yes":
+        if action.lower() == "remove":
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             
@@ -3158,11 +3160,31 @@ def clean_unknown_reports():
             
             finally:
                 conn.close()
+        
+        elif action.lower() == "fix":
+            try:
+                # Import the UnknownReportFixer class
+                from fix_unknown_reports import UnknownReportFixer
+                console.print("[green]Launching the LLM-based report fixer...[/green]")
+                fixer = UnknownReportFixer()
+                fixer.fix_unknown_reports()
+                console.print("[green]Completed fixing unknown reports with LLM analysis[/green]")
+            except Exception as e:
+                console.print(f"[red]Error fixing unknown reports: {e}[/red]")
+                console.print("[yellow]Make sure the fix_unknown_reports.py module is available and properly configured.[/yellow]")
+        
+        else:  # cancel
+            console.print("[yellow]Operation cancelled. No changes were made to the database.[/yellow]")
     
     # Show final advice
     console.print("\n[bold]Next steps:[/bold]")
-    console.print("1. Select option 4 to rebuild the detection library")
-    console.print("2. Then use copy_templates.py to transfer templates to DeepCurrent")
+    if action.lower() == "fix":
+        console.print("1. Check if any reports still have unknown vulnerability types")
+        console.print("2. Select option 4 to rebuild the detection library")
+        console.print("3. Then use copy_templates.py to transfer templates to DeepCurrent")
+    else:
+        console.print("1. Select option 4 to rebuild the detection library")
+        console.print("2. Then use copy_templates.py to transfer templates to DeepCurrent")
 
 def import_cached_templates():
     """Import templates from the cache directory into the vectorisation.db database"""
